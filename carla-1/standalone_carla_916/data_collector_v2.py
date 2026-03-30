@@ -10,6 +10,7 @@ Output: save_dir/Scenario8/Repetition0_TownXX/route_NN/{rgb,lidar,...}
 """
 
 import carla
+from agents.navigation.basic_agent import BasicAgent
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 from agents.navigation.local_planner import RoadOption
 import numpy as np
@@ -277,128 +278,6 @@ class SensorData:
 
 
 # ============================================================================
-# Route & waypoint planning
-# ============================================================================
-class RoutePlanner:
-    """GRP-based route planner that provides proper RoadOption commands.
-
-    Uses CARLA's GlobalRoutePlanner to generate routes with accurate
-    LEFT/RIGHT/STRAIGHT/FOLLOW_LANE navigation commands. The traffic
-    manager is instructed to follow the same route so that the
-    autopilot's driving matches the saved commands exactly.
-    """
-
-    def __init__(self, world, vehicle, traffic_manager=None,
-                 sampling_resolution=2.0):
-        self.world = world
-        self.map = world.get_map()
-        self.vehicle = vehicle
-        self.traffic_manager = traffic_manager
-        self.grp = GlobalRoutePlanner(self.map, sampling_resolution)
-        self.route = []           # list of (carla.Waypoint, RoadOption)
-        self.route_index = 0
-        self._target_road_option = RoadOption.LANEFOLLOW
-        self._diverged = False
-        self._generate_route()
-
-    # ------------------------------------------------------------------
-    def _generate_route(self):
-        """Find a single long, continuous route via GRP."""
-        spawn_points = self.map.get_spawn_points()
-        self.route = []
-        current_loc = self.vehicle.get_location()
-        
-        # Try multiple times to find a long route
-        for _ in range(20):
-            dest = random.choice(spawn_points).location
-            try:
-                segment = self.grp.trace_route(current_loc, dest)
-                if segment and len(segment) > 150:  # > 300m route
-                    self.route = segment
-                    break
-            except Exception:
-                continue
-        
-        self.route_index = 0
-        self._set_tm_path()
-
-    def _extend_route(self):
-        """Do nothing. We only use the single continuous route."""
-        pass
-
-    def _set_tm_path(self):
-        """Tell the traffic-manager autopilot to follow our route."""
-        if self.traffic_manager is None or not self.route:
-            return
-        # Pass the remaining path locations to TM
-        path = [wp.transform.location for wp, _ in self.route]
-        try:
-            self.traffic_manager.set_path(self.vehicle, path)
-        except Exception as e:
-            print(f'  [INFO] TM set_path unavailable ({e}).')
-
-    # ------------------------------------------------------------------
-    def _advance_index(self):
-        """Snap route_index to the closest waypoint to the vehicle."""
-        if self._diverged or self.route_index >= len(self.route):
-            return
-
-        loc = self.vehicle.get_location()
-        min_dist = float('inf')
-        min_idx = self.route_index
-        search_end = min(self.route_index + 40, len(self.route))
-        
-        for i in range(self.route_index, search_end):
-            d = loc.distance(self.route[i][0].transform.location)
-            if d < min_dist:
-                min_dist = d
-                min_idx = i
-                
-        # If the car naturally progressed, snap to it
-        if min_dist < 4.0:
-            self.route_index = min_idx + 1
-        else:
-            self.route_index = min_idx
-            
-        # Detect if the TM disobeyed the set_path and wandered off!
-        # If the car is > 5.0m away from its expected route snippet, it diverged.
-        if min_dist > 5.0:
-            print(f"  [ROUTE] EGO vehicle diverged from path! (dist={min_dist:.1f}m)")
-            self._diverged = True
-
-    # ------------------------------------------------------------------
-    def get_next_waypoints(self, n=20):
-        """Return the next *n* carla.Waypoint objects (no RoadOption)."""
-        self._advance_index()
-        if self._diverged:
-            return []
-        end = min(self.route_index + n, len(self.route))
-        return [wp for wp, _ in self.route[self.route_index:end]]
-
-    def get_target_point(self):
-        """Far target point (~20 m ahead, index 9)."""
-        self._advance_index()
-        if self._diverged or self.route_index >= len(self.route)-1:
-            return self.route[-1][0] if self.route else None
-            
-        idx = min(self.route_index + 9, len(self.route) - 1)
-        wp, road_option = self.route[idx]
-        self._target_road_option = road_option
-        return wp
-
-    def get_command(self, _wp=None):
-        """Navigation command from GRP RoadOption (1=L 2=R 3=S 4=Follow)."""
-        ro = self._target_road_option
-        if ro == RoadOption.LEFT:   return 1
-        if ro == RoadOption.RIGHT:  return 2
-        if ro == RoadOption.STRAIGHT: return 3
-        return 4  # LANEFOLLOW, CHANGELANELEFT, CHANGELANERIGHT, VOID
-
-    def is_route_complete(self):
-        """End route if completed OR if the TM wandered off."""
-        return self._diverged or self.route_index >= len(self.route) - 5
-
-
 # ============================================================================
 # Bounding box extraction
 # ============================================================================
@@ -790,8 +669,8 @@ def setup_sensors(world, vehicle, sensor_data):
 # ============================================================================
 # Core collection loop (per route)
 # ============================================================================
-def collect_route(world, vehicle, route_dir, route_planner,
-                  min_frames=60, max_frames=800):
+def collect_route(world, vehicle, route_dir, agent,
+                  min_frames=60, max_frames=800, sensor_tick=0.05):
     """Collect data for one route. Returns number of frames saved."""
     # Create all subdirectories matching C-Shenron data_agent.py
     subdirs = [
@@ -930,7 +809,8 @@ def collect_route(world, vehicle, route_dir, route_planner,
                              ).astype(np.uint8)
 
             # --- Get autopilot control ---
-            control = vehicle.get_control()
+            control = agent.run_step()
+            vehicle.apply_control(control)
             speed = get_forward_speed(vehicle)
 
             # Stuck detection
@@ -940,8 +820,16 @@ def collect_route(world, vehicle, route_dir, route_planner,
                 stuck_count = 0
 
             # --- Route info ---
-            wps = route_planner.get_next_waypoints(NUM_ROUTE_POINTS)
-            target_wp = route_planner.get_target_point()
+            plan = agent.get_local_planner().get_plan()
+            if not plan:
+                print('    Route cleanly completed (no plan remaining).')
+                break
+                
+            wps = [p[0] for p in plan[:NUM_ROUTE_POINTS]]
+            if len(plan) > 9:
+                target_wp, road_option = plan[9]
+            else:
+                target_wp, road_option = plan[-1]
 
             ego_transform = vehicle.get_transform()
             ego_loc = ego_transform.location
@@ -990,7 +878,13 @@ def collect_route(world, vehicle, route_dir, route_planner,
                 angle = 0.0
 
             # Navigation command
-            cmd = route_planner.get_command(target_wp)
+            def map_command(cmd_ro):
+                if cmd_ro == RoadOption.LEFT: return 1
+                elif cmd_ro == RoadOption.RIGHT: return 2
+                elif cmd_ro == RoadOption.STRAIGHT: return 3
+                return 4  # LANEFOLLOW
+                
+            cmd = map_command(road_option)
             next_cmd = cmd
 
             # Check junction explicitly based on current ego position
@@ -1168,9 +1062,10 @@ def collect_route(world, vehicle, route_dir, route_planner,
                       f'aug_r={aug_rotation_buf[0]:+.1f}deg')
 
             # End route conditions
-            if route_planner.is_route_complete() and \
-               frame_count >= min_frames:
+            if getattr(agent, 'done', lambda: False)() or len(plan) == 0:
+                print('    Route cleanly completed.')
                 break
+                
             if stuck_count > 200 and frame_count >= min_frames:
                 print('    Route ended: vehicle stuck')
                 break
@@ -1259,20 +1154,29 @@ def run_collection(args):
                 time.sleep(0.5)
                 continue
 
-            ego_vehicle.set_autopilot(True, 8000)
+            # We DO NOT set TrafficManager autopilot. BasicAgent drives the car directly!
+            agent = BasicAgent(ego_vehicle, target_speed=30, opt_dict={'ignore_traffic_lights': False})
+            
+            # Find a single long route and set it natively in the agent
+            route_found = False
+            for _ in range(20):
+                dest = random.choice(spawn_points).location
+                agent.set_destination(dest)
+                plan = agent.get_local_planner().get_plan()
+                if plan and len(plan) > 150:
+                    route_found = True
+                    break
+                    
+            if not route_found:
+                ego_vehicle.destroy()
+                ego_vehicle = None
+                continue
+
             world.tick()
             world.tick()
 
             # Shuffle weather per route (like C-Shenron)
             shuffle_weather(world, ego_vehicle)
-
-            # Plan a route
-            planner = RoutePlanner(world, ego_vehicle,
-                                    traffic_manager=tm)
-            if len(planner.route) < 30:
-                ego_vehicle.destroy()
-                ego_vehicle = None
-                continue
 
             route_name = f'route_{route_counter:02d}'
             route_dir = os.path.join(repetition_dir, route_name)
@@ -1286,7 +1190,7 @@ def run_collection(args):
 
             try:
                 frames = collect_route(
-                    world, ego_vehicle, route_dir, planner,
+                    world, ego_vehicle, route_dir, agent,
                     min_frames=60, max_frames=800)
             except Exception as e:
                 print(f'  Route error: {e}')
