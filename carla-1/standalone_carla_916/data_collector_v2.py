@@ -404,8 +404,8 @@ def shuffle_weather(world, vehicle):
     weather.sun_altitude_angle = altitude
     weather.sun_azimuth_angle = random.choice(AZIMUTHS)
     
-    # Temporarily set to 50% chance so you can test and see the fog immediately!
-    if random.random() < 0.5:
+    # ~10% chance of fog for weather variety without dominating the dataset
+    if random.random() < 0.1:
         weather.fog_density = random.uniform(40.0, 90.0)
         weather.fog_distance = random.uniform(5.0, 15.0)
         weather.fog_falloff = random.uniform(0.1, 0.5)
@@ -705,6 +705,13 @@ def collect_route(world, vehicle, route_dir, agent,
     step = 0
     frame_count = 0
     stuck_count = 0
+    collision_occurred = [False]
+
+    # Collision sensor — flags route for discard
+    collision_bp = world.get_blueprint_library().find('sensor.other.collision')
+    collision_sensor = world.spawn_actor(collision_bp, carla.Transform(), attach_to=vehicle)
+    collision_sensor.listen(lambda event: collision_occurred.__setitem__(0, True))
+    sensors.append(collision_sensor)
 
     try:
         # Let sensors stabilize
@@ -899,7 +906,7 @@ def collect_route(world, vehicle, route_dir, agent,
             )
 
             # Assign literal float target speeds (C-Shenron indexers handle floats later)
-            if speed < 0.1 and control.brake > 0.5:
+            if speed < 0.1:
                 target_speed = 0.0
             elif walkers_near:
                 target_speed = 2.0
@@ -909,7 +916,7 @@ def collect_route(world, vehicle, route_dir, agent,
                 target_speed = 8.0
 
             # Hazard flags (from autopilot behavior)
-            brake = bool(control.brake > 0.5)
+            brake = bool(speed < 0.1 or control.brake > 0.5)
             vehicle_hazard = brake and speed > 0.5
             # Detect traffic light state for C-Shenron training
             tl = vehicle.get_traffic_light()
@@ -1066,9 +1073,10 @@ def collect_route(world, vehicle, route_dir, agent,
             if getattr(agent, 'done', lambda: False)() or len(plan) == 0:
                 print('    Route cleanly completed.')
                 break
-                
-            if stuck_count > 200 and frame_count >= min_frames:
-                print('    Route ended: vehicle stuck')
+
+            if collision_occurred[0]:
+                print('    Route ended: COLLISION — discarding')
+                frame_count = -1
                 break
 
     finally:
@@ -1101,6 +1109,16 @@ def run_collection(args):
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = 1.0 / CARLA_FPS
     world.apply_settings(settings)
+
+    # Shorten traffic light durations for faster data collection
+    # Must tick first so traffic light actors are registered
+    world.tick()
+    tl_actors = world.get_actors().filter('traffic.traffic_light')
+    for tl in tl_actors:
+        tl.set_green_time(15.0)
+        tl.set_red_time(5.0)
+        tl.set_yellow_time(2.0)
+    print(f'  Traffic lights: {len(tl_actors)} found, red=5s, yellow=2s, green=15s')
 
     # Dataset directory: root/Scenario8/Repetition0_TownXX
     scenario_dir = os.path.join(args.save_dir, 'Scenario8')
@@ -1167,19 +1185,29 @@ def run_collection(args):
             # We tune it down to 1.0 to ensure smooth human-like data collection.
             agent_opts = {
                 'ignore_traffic_lights': False,
-                'lateral_control_dict': {'K_P': 1.0, 'K_I': 0.0, 'K_D': 0.1, 'dt': 1.0/20.0}
+                'lateral_control_dict': {'K_P': 1.25, 'K_I': 0.0, 'K_D': 0.1, 'dt': 1.0/20.0}
             }
             agent = BasicAgent(ego_vehicle, target_speed=30, opt_dict=agent_opts)
             
             # Find a single long route and set it natively in the agent
             route_found = False
+            ego_transform = ego_vehicle.get_transform()
+            ego_loc = ego_transform.location
+            ego_yaw = np.deg2rad(ego_transform.rotation.yaw)
             for _ in range(20):
                 dest = random.choice(spawn_points).location
                 agent.set_destination(dest)
                 plan = agent.get_local_planner().get_plan()
                 if plan and len(plan) > 150:
-                    route_found = True
-                    break
+                    # Verify route starts AHEAD of the car, not behind
+                    first_wp = list(plan)[5][0].transform.location
+                    dx = first_wp.x - ego_loc.x
+                    dy = first_wp.y - ego_loc.y
+                    # Project onto ego forward axis
+                    forward = dx * np.cos(ego_yaw) + dy * np.sin(ego_yaw)
+                    if forward > 0:
+                        route_found = True
+                        break
                     
             if not route_found:
                 ego_vehicle.destroy()
@@ -1208,18 +1236,21 @@ def run_collection(args):
                 traceback.print_exc()
                 frames = 0
 
-            # Only save results if we got enough frames
+            # Only save results if clean route with enough frames
             if frames >= 40:
                 save_results(route_dir)
                 total_frames += frames
                 print(f'  Saved {frames} frames -> {route_name}')
                 route_counter += 1
             else:
-                # Clean up incomplete route
+                # Clean up bad or incomplete route
                 import shutil
                 if os.path.exists(route_dir):
                     shutil.rmtree(route_dir)
-                print(f'  Route too short ({frames} frames), discarded')
+                if frames < 0:
+                    print(f'  Route DISCARDED (collision or stuck)')
+                else:
+                    print(f'  Route too short ({frames} frames), discarded')
 
             # Destroy ego for respawn
             if ego_vehicle is not None:
