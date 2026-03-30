@@ -825,11 +825,12 @@ def collect_route(world, vehicle, route_dir, agent,
                 print('    Route cleanly completed (no plan remaining).')
                 break
                 
-            wps = [p[0] for p in plan[:NUM_ROUTE_POINTS]]
-            if len(plan) > 9:
-                target_wp, road_option = plan[9]
+            plan_list = list(plan)
+            wps = [p[0] for p in plan_list[:NUM_ROUTE_POINTS]]
+            if len(plan_list) > 9:
+                target_wp, road_option = plan_list[9]
             else:
-                target_wp, road_option = plan[-1]
+                target_wp, road_option = plan_list[-1]
 
             ego_transform = vehicle.get_transform()
             ego_loc = ego_transform.location
@@ -1154,8 +1155,21 @@ def run_collection(args):
                 time.sleep(0.5)
                 continue
 
+            # CRITICAL: We must tick the physics engine immediately after spawning!
+            # Otherwise, ego_vehicle.get_location() evaluates to (0,0,0) and the 
+            # BasicAgent plans a 300m route starting from the absolute map origin 
+            # instead of where the vehicle actually spawned!
+            world.tick()
+            world.tick()
+
             # We DO NOT set TrafficManager autopilot. BasicAgent drives the car directly!
-            agent = BasicAgent(ego_vehicle, target_speed=30, opt_dict={'ignore_traffic_lights': False})
+            # The default BasicAgent lateral K_P is 1.95 which causes wiggling. 
+            # We tune it down to 1.0 to ensure smooth human-like data collection.
+            agent_opts = {
+                'ignore_traffic_lights': False,
+                'lateral_control_dict': {'K_P': 1.0, 'K_I': 0.0, 'K_D': 0.1, 'dt': 1.0/20.0}
+            }
+            agent = BasicAgent(ego_vehicle, target_speed=30, opt_dict=agent_opts)
             
             # Find a single long route and set it natively in the agent
             route_found = False
@@ -1171,9 +1185,6 @@ def run_collection(args):
                 ego_vehicle.destroy()
                 ego_vehicle = None
                 continue
-
-            world.tick()
-            world.tick()
 
             # Shuffle weather per route (like C-Shenron)
             shuffle_weather(world, ego_vehicle)
