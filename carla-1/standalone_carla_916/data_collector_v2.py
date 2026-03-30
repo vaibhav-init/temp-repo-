@@ -404,8 +404,8 @@ def shuffle_weather(world, vehicle):
     weather.sun_altitude_angle = altitude
     weather.sun_azimuth_angle = random.choice(AZIMUTHS)
     
-    # ~10% chance of fog for weather variety without dominating the dataset
-    if random.random() < 0.1:
+    # Temporarily set to 50% chance so you can test and see the fog immediately!
+    if random.random() < 0.5:
         weather.fog_density = random.uniform(40.0, 90.0)
         weather.fog_distance = random.uniform(5.0, 15.0)
         weather.fog_falloff = random.uniform(0.1, 0.5)
