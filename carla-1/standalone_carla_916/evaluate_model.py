@@ -578,9 +578,9 @@ class ShenronEvalAgent:
         if self.config.use_controller_input_prediction:
             pred_target_speed_probs = F.softmax(pred_target_speed[0], dim=0)
             pred_aim_wp = pred_checkpoint[0][1].detach().cpu().numpy()
-            # Our data convention (from data_collector_v2.py with preprocessed compass)
-            # stores waypoints as [x_lateral, y_forward]. Swap indices accordingly:
-            pred_angle = -math.degrees(math.atan2(-pred_aim_wp[0], pred_aim_wp[1])) / 90.0
+            # Ego-local convention: [0]=forward (X), [1]=lateral (Y)
+            # Matches C-Shenron autopilot.py _get_angle_to() and data_collector_v2.py
+            pred_angle = -math.degrees(math.atan2(-pred_aim_wp[1], pred_aim_wp[0])) / 90.0
 
             if self.uncertainty_weight:
                 uncertainty = pred_target_speed_probs.detach().cpu().numpy()
@@ -627,16 +627,6 @@ class ShenronEvalAgent:
             self.stuck_detector = 0
         elif self.config.use_controller_input_prediction:
             steer, throttle, brake = self.net.control_pid_direct(target_speed, pred_angle, gt_velocity)
-            # --- Proportional lane-centering + junction turning correction ---
-            # The model was trained without augmentation, so it can't correct lateral drift
-            # or steer through junctions. Use stronger proportional correction.
-            ego_target_np = ego_target.cpu().numpy()[0]
-            lateral_offset = ego_target_np[0]  # negative = target is left = car drifted right
-            forward_dist = max(abs(ego_target_np[1]), 1.0)
-            # Stronger gain (0.6) and wider clip (0.8) for junction handling
-            correction = -0.6 * (lateral_offset / forward_dist)
-            correction = np.clip(correction, -0.8, 0.8)
-            steer = float(np.clip(steer + correction, -1.0, 1.0))
         elif self.config.use_wp_gru:
             steer, throttle, brake = self.net.control_pid(self.pred_wp, gt_velocity)
         else:
@@ -1032,8 +1022,9 @@ Examples:
             speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
 
             gps = np.array([transform.location.x, transform.location.y])
-            # Match the compass convention used during training.
-            compass = t_u.preprocess_compass(math.radians(transform.rotation.yaw))
+            # Match the compass convention used during training (data_collector_v2.py).
+            # No -90° offset: we read transform.rotation.yaw directly, not IMU compass.
+            compass = t_u.normalize_angle(math.radians(transform.rotation.yaw))
 
             # --- Global Route Planner Logic ---
             # Pop passed waypoints by finding the physically closest point ahead of the car
@@ -1063,7 +1054,7 @@ Examples:
                 elif cmd == RoadOption.STRAIGHT: return 3
                 else: return 4
 
-            target_wp1, cmd1 = current_route[min(len(current_route)-1, 5)]
+            target_wp1, cmd1 = current_route[min(len(current_route)-1, 9)]
             target_loc = target_wp1.transform.location
             target_point = np.array([target_loc.x, target_loc.y])
             nav_command = map_command(cmd1)

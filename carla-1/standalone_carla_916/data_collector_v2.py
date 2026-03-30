@@ -10,6 +10,8 @@ Output: save_dir/Scenario8/Repetition0_TownXX/route_NN/{rgb,lidar,...}
 """
 
 import carla
+from agents.navigation.global_route_planner import GlobalRoutePlanner
+from agents.navigation.local_planner import RoadOption
 import numpy as np
 import cv2
 import os
@@ -192,8 +194,11 @@ class SensorData:
     """Thread-safe storage for async sensor callbacks."""
     def __init__(self):
         self.rgb = None
+        self.rgb_augmented = None
         self.semantics = None
+        self.semantics_augmented = None
         self.depth = None
+        self.depth_augmented = None
         self.bev_semantics = None
         self.lidar = None
         self.semantic_lidar = None
@@ -206,15 +211,30 @@ class SensorData:
         self.rgb = array
         self.frame = image.frame
 
+    def rgb_augmented_callback(self, image):
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        array = array.reshape((image.height, image.width, 4))[:, :, :3]
+        self.rgb_augmented = array
+
     def semantics_callback(self, image):
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
         array = array.reshape((image.height, image.width, 4))
         self.semantics = array[:, :, 2]  # Red channel = semantic tag
 
+    def semantics_augmented_callback(self, image):
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        array = array.reshape((image.height, image.width, 4))
+        self.semantics_augmented = array[:, :, 2]
+
     def depth_callback(self, image):
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
         array = array.reshape((image.height, image.width, 4))[:, :, :3]
         self.depth = array
+
+    def depth_augmented_callback(self, image):
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        array = array.reshape((image.height, image.width, 4))[:, :, :3]
+        self.depth_augmented = array
 
     def bev_semantics_callback(self, image):
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
@@ -246,8 +266,11 @@ class SensorData:
 
     def all_ready(self):
         return (self.rgb is not None and
+                self.rgb_augmented is not None and
                 self.semantics is not None and
+                self.semantics_augmented is not None and
                 self.depth is not None and
+                self.depth_augmented is not None and
                 self.bev_semantics is not None and
                 self.lidar is not None and
                 self.semantic_lidar is not None)
@@ -257,89 +280,122 @@ class SensorData:
 # Route & waypoint planning
 # ============================================================================
 class RoutePlanner:
-    """Simple route planner using CARLA waypoints."""
+    """GRP-based route planner that provides proper RoadOption commands.
 
-    def __init__(self, world, vehicle, spacing=2.0):
+    Uses CARLA's GlobalRoutePlanner to generate routes with accurate
+    LEFT/RIGHT/STRAIGHT/FOLLOW_LANE navigation commands. The traffic
+    manager is instructed to follow the same route so that the
+    autopilot's driving matches the saved commands exactly.
+    """
+
+    def __init__(self, world, vehicle, traffic_manager=None,
+                 sampling_resolution=2.0):
         self.world = world
         self.map = world.get_map()
         self.vehicle = vehicle
-        self.spacing = spacing
-        self.route = []
+        self.traffic_manager = traffic_manager
+        self.grp = GlobalRoutePlanner(self.map, sampling_resolution)
+        self.route = []           # list of (carla.Waypoint, RoadOption)
         self.route_index = 0
+        self._target_road_option = RoadOption.LANEFOLLOW
         self._generate_route()
 
+    # ------------------------------------------------------------------
     def _generate_route(self):
-        """Generate a random route through the map."""
+        """Build a long route by chaining random destinations via GRP."""
         spawn_points = self.map.get_spawn_points()
-        if len(spawn_points) < 2:
-            return
-        start_wp = self.map.get_waypoint(self.vehicle.get_location())
-        # Build a long route by following random waypoints
         self.route = []
-        current = start_wp
-        for _ in range(500):
-            nexts = current.next(self.spacing)
-            if not nexts:
-                break
-            # At junctions, pick randomly
-            if len(nexts) > 1:
-                current = random.choice(nexts)
-            else:
-                current = nexts[0]
-            self.route.append(current)
+        current_loc = self.vehicle.get_location()
+        for _ in range(5):                       # chain 5 random legs
+            dest = random.choice(spawn_points).location
+            try:
+                segment = self.grp.trace_route(current_loc, dest)
+                if segment:
+                    self.route.extend(segment)
+                    current_loc = segment[-1][0].transform.location
+            except Exception:
+                continue
         self.route_index = 0
+        self._set_tm_path()
 
-    def get_next_waypoints(self, n=20):
-        """Get next n waypoints from current position."""
+    def _extend_route(self):
+        """Append a new random leg when the route runs low."""
+        spawn_points = self.map.get_spawn_points()
+        if self.route:
+            current_loc = self.route[-1][0].transform.location
+        else:
+            current_loc = self.vehicle.get_location()
+        for _ in range(3):
+            dest = random.choice(spawn_points).location
+            try:
+                segment = self.grp.trace_route(current_loc, dest)
+                if segment:
+                    self.route.extend(segment)
+                    current_loc = segment[-1][0].transform.location
+                    break
+            except Exception:
+                continue
+        self._set_tm_path()
+
+    def _set_tm_path(self):
+        """Tell the traffic-manager autopilot to follow our route."""
+        if self.traffic_manager is None or not self.route:
+            return
+        remaining = self.route[self.route_index:]
+        path = [wp.transform.location for wp, _ in remaining]
+        try:
+            self.traffic_manager.set_path(self.vehicle, path)
+        except Exception as e:
+            # set_path may not exist in every CARLA build
+            print(f'  [INFO] TM set_path unavailable ({e}), '
+                  'autopilot will use its own route.')
+
+    # ------------------------------------------------------------------
+    def _advance_index(self):
+        """Snap route_index to the closest waypoint to the vehicle."""
         loc = self.vehicle.get_location()
-        # Advance route index to closest waypoint
         min_dist = float('inf')
         min_idx = self.route_index
-        search_end = min(self.route_index + 50, len(self.route))
+        search_end = min(self.route_index + 40, len(self.route))
         for i in range(self.route_index, search_end):
-            wp_loc = self.route[i].transform.location
-            dist = loc.distance(wp_loc)
-            if dist < min_dist:
-                min_dist = dist
+            d = loc.distance(self.route[i][0].transform.location)
+            if d < min_dist:
+                min_dist = d
                 min_idx = i
-        self.route_index = min_idx
+        if min_dist < 4.0:
+            self.route_index = min_idx + 1
+        else:
+            self.route_index = min_idx
 
-        # Get next n waypoints
+    # ------------------------------------------------------------------
+    def get_next_waypoints(self, n=20):
+        """Return the next *n* carla.Waypoint objects (no RoadOption)."""
+        self._advance_index()
+        if len(self.route) - self.route_index < n + 10:
+            self._extend_route()
         end = min(self.route_index + n, len(self.route))
-        return self.route[self.route_index:end]
+        return [wp for wp, _ in self.route[self.route_index:end]]
+
+    def get_target_point(self):
+        """Far target point (~20 m ahead, index 9)."""
+        self._advance_index()
+        if len(self.route) - self.route_index < 15:
+            self._extend_route()
+        idx = min(self.route_index + 9, len(self.route) - 1)
+        wp, road_option = self.route[idx]
+        self._target_road_option = road_option
+        return wp
+
+    def get_command(self, _wp=None):
+        """Navigation command from GRP RoadOption (1=L 2=R 3=S 4=Follow)."""
+        ro = self._target_road_option
+        if ro == RoadOption.LEFT:   return 1
+        if ro == RoadOption.RIGHT:  return 2
+        if ro == RoadOption.STRAIGHT: return 3
+        return 4  # LANEFOLLOW, CHANGELANELEFT, CHANGELANERIGHT, VOID
 
     def is_route_complete(self):
         return self.route_index >= len(self.route) - 5
-
-    def get_target_point(self):
-        """Get the far target point for navigation command."""
-        wps = self.get_next_waypoints(20)
-        if len(wps) >= 10:
-            return wps[9]
-        elif len(wps) > 0:
-            return wps[-1]
-        return None
-
-    def get_command(self, wp):
-        """Determine navigation command for a waypoint.
-        RoadOption: 1=Left, 2=Right, 3=Straight, 4=LaneFollow,
-                    5=ChangeLaneLeft, 6=ChangeLaneRight"""
-        if wp is None:
-            return 4  # LaneFollow
-        if wp.is_junction:
-            # Check which direction the route turns at this junction
-            loc = self.vehicle.get_location()
-            forward = self.vehicle.get_transform().get_forward_vector()
-            wp_vec = wp.transform.location - loc
-            # Cross product for turn direction
-            cross = forward.x * wp_vec.y - forward.y * wp_vec.x
-            if cross > 2.0:
-                return 1  # Left
-            elif cross < -2.0:
-                return 2  # Right
-            else:
-                return 3  # Straight
-        return 4  # LaneFollow
 
 
 # ============================================================================
@@ -602,22 +658,36 @@ def spawn_npcs(client, world, num_vehicles=50, num_walkers=30):
 # Sensor setup
 # ============================================================================
 def setup_sensors(world, vehicle, sensor_data):
-    """Attach all sensors matching C-Shenron config."""
+    """Attach all sensors matching C-Shenron config.
+    Returns (all_sensors_list, augmented_cameras_dict).
+    augmented_cameras_dict contains the 3 augmented camera actors
+    so collect_route can move them each frame.
+    """
     bp_lib = world.get_blueprint_library()
     sensors = []
+
+    rgb_transform = carla.Transform(
+        carla.Location(x=CAMERA_POS[0], y=CAMERA_POS[1], z=CAMERA_POS[2]),
+        carla.Rotation(roll=CAMERA_ROT[0], pitch=CAMERA_ROT[1],
+                       yaw=CAMERA_ROT[2]))
 
     # 1. RGB Camera
     rgb_bp = bp_lib.find('sensor.camera.rgb')
     rgb_bp.set_attribute('image_size_x', str(CAMERA_WIDTH))
     rgb_bp.set_attribute('image_size_y', str(CAMERA_HEIGHT))
     rgb_bp.set_attribute('fov', str(CAMERA_FOV))
-    rgb_transform = carla.Transform(
-        carla.Location(x=CAMERA_POS[0], y=CAMERA_POS[1], z=CAMERA_POS[2]),
-        carla.Rotation(roll=CAMERA_ROT[0], pitch=CAMERA_ROT[1],
-                       yaw=CAMERA_ROT[2]))
     rgb_sensor = world.spawn_actor(rgb_bp, rgb_transform, attach_to=vehicle)
     rgb_sensor.listen(sensor_data.rgb_callback)
     sensors.append(rgb_sensor)
+
+    # 1b. RGB Augmented Camera (randomly shifted each frame)
+    rgb_aug_bp = bp_lib.find('sensor.camera.rgb')
+    rgb_aug_bp.set_attribute('image_size_x', str(CAMERA_WIDTH))
+    rgb_aug_bp.set_attribute('image_size_y', str(CAMERA_HEIGHT))
+    rgb_aug_bp.set_attribute('fov', str(CAMERA_FOV))
+    rgb_aug_sensor = world.spawn_actor(rgb_aug_bp, rgb_transform, attach_to=vehicle)
+    rgb_aug_sensor.listen(sensor_data.rgb_augmented_callback)
+    sensors.append(rgb_aug_sensor)
 
     # 2. Semantic Segmentation Camera
     sem_bp = bp_lib.find('sensor.camera.semantic_segmentation')
@@ -628,6 +698,15 @@ def setup_sensors(world, vehicle, sensor_data):
     sem_sensor.listen(sensor_data.semantics_callback)
     sensors.append(sem_sensor)
 
+    # 2b. Semantic Augmented Camera
+    sem_aug_bp = bp_lib.find('sensor.camera.semantic_segmentation')
+    sem_aug_bp.set_attribute('image_size_x', str(CAMERA_WIDTH))
+    sem_aug_bp.set_attribute('image_size_y', str(CAMERA_HEIGHT))
+    sem_aug_bp.set_attribute('fov', str(CAMERA_FOV))
+    sem_aug_sensor = world.spawn_actor(sem_aug_bp, rgb_transform, attach_to=vehicle)
+    sem_aug_sensor.listen(sensor_data.semantics_augmented_callback)
+    sensors.append(sem_aug_sensor)
+
     # 3. Depth Camera
     depth_bp = bp_lib.find('sensor.camera.depth')
     depth_bp.set_attribute('image_size_x', str(CAMERA_WIDTH))
@@ -637,6 +716,16 @@ def setup_sensors(world, vehicle, sensor_data):
                                      attach_to=vehicle)
     depth_sensor.listen(sensor_data.depth_callback)
     sensors.append(depth_sensor)
+
+    # 3b. Depth Augmented Camera
+    depth_aug_bp = bp_lib.find('sensor.camera.depth')
+    depth_aug_bp.set_attribute('image_size_x', str(CAMERA_WIDTH))
+    depth_aug_bp.set_attribute('image_size_y', str(CAMERA_HEIGHT))
+    depth_aug_bp.set_attribute('fov', str(CAMERA_FOV))
+    depth_aug_sensor = world.spawn_actor(depth_aug_bp, rgb_transform,
+                                         attach_to=vehicle)
+    depth_aug_sensor.listen(sensor_data.depth_augmented_callback)
+    sensors.append(depth_aug_sensor)
 
     # 4. BEV Semantic Camera (top-down)
     bev_bp = bp_lib.find('sensor.camera.semantic_segmentation')
@@ -687,7 +776,14 @@ def setup_sensors(world, vehicle, sensor_data):
     radar_sensor.listen(sensor_data.radar_callback)
     sensors.append(radar_sensor)
 
-    return sensors
+    # Collect augmented camera actors so we can move them each frame
+    augmented_cameras = {
+        'rgb': rgb_aug_sensor,
+        'sem': sem_aug_sensor,
+        'depth': depth_aug_sensor,
+    }
+
+    return sensors, augmented_cameras
 
 
 # ============================================================================
@@ -709,7 +805,17 @@ def collect_route(world, vehicle, route_dir, route_planner,
         os.makedirs(os.path.join(route_dir, sd), exist_ok=True)
 
     sensor_data = SensorData()
-    sensors = setup_sensors(world, vehicle, sensor_data)
+    sensors, augmented_cameras = setup_sensors(world, vehicle, sensor_data)
+
+    # Augmentation parameters (matching C-Shenron config.py)
+    AUG_TRANSLATION_MIN = -1.0  # meters lateral shift
+    AUG_TRANSLATION_MAX = 1.0
+    AUG_ROTATION_MIN = -5.0     # degrees yaw
+    AUG_ROTATION_MAX = 5.0
+    # Buffer: augmentation set now applies to the NEXT rendered frame
+    from collections import deque
+    aug_translation_buf = deque([0.0], maxlen=2)
+    aug_rotation_buf = deque([0.0], maxlen=2)
 
     # State for LiDAR sweep merging
     last_lidar = None
@@ -795,6 +901,25 @@ def collect_route(world, vehicle, route_dir, route_planner,
             if step % DATA_SAVE_FREQ != 0:
                 continue
 
+            # --- Randomly shift augmented cameras for THIS frame ---
+            # (the image we capture now reflects the transform set LAST tick,
+            #  so we read aug_translation_buf[0] for the current saved image
+            #  and set the NEW random offset for the next frame)
+            aug_t = np.random.uniform(AUG_TRANSLATION_MIN, AUG_TRANSLATION_MAX)
+            aug_r = np.random.uniform(AUG_ROTATION_MIN, AUG_ROTATION_MAX)
+            aug_translation_buf.append(aug_t)
+            aug_rotation_buf.append(aug_r)
+
+            aug_cam_transform = carla.Transform(
+                carla.Location(x=CAMERA_POS[0],
+                               y=CAMERA_POS[1] + aug_t,
+                               z=CAMERA_POS[2]),
+                carla.Rotation(roll=CAMERA_ROT[0],
+                               pitch=CAMERA_ROT[1],
+                               yaw=CAMERA_ROT[2] + aug_r))
+            for cam in augmented_cameras.values():
+                cam.set_transform(aug_cam_transform)
+
             frame = frame_count
             frame_str = f'{frame:04d}'
 
@@ -846,9 +971,10 @@ def collect_route(world, vehicle, route_dir, route_planner,
                     wp_2d, pos[:2], theta).tolist()
                 dense_route.append(ego_wp)
 
-            # Aim waypoint (closest route point)
-            if len(wps) >= 3:
-                aim_loc = wps[2].transform.location
+            # Aim waypoint — use the 2nd route waypoint (~4m ahead)
+            # Matches original autopilot.py _get_steer: route[1][0]
+            if len(wps) >= 2:
+                aim_loc = wps[1].transform.location
                 aim_2d = np.array([aim_loc.x, aim_loc.y])
                 ego_aim = inverse_conversion_2d(
                     aim_2d, pos[:2], theta).tolist()
@@ -922,8 +1048,8 @@ def collect_route(world, vehicle, route_dir, route_planner,
                 'stop_sign_close': False,
                 'walker_close': False,
                 'angle': float(angle),
-                'augmentation_translation': 0.0,
-                'augmentation_rotation': 0.0,
+                'augmentation_translation': float(aug_translation_buf[0]),
+                'augmentation_rotation': float(aug_rotation_buf[0]),
                 'ego_matrix': ego_transform.get_matrix(),
             }
 
@@ -931,25 +1057,28 @@ def collect_route(world, vehicle, route_dir, route_planner,
             bboxes = get_bounding_boxes(vehicle, world, sem_lidar_360)
 
             # --- Save everything ---
-            # RGB + augmented (identical copy)
+            # RGB (normal + genuinely augmented from shifted camera)
             cv2.imwrite(os.path.join(route_dir, 'rgb',
                         f'{frame_str}.jpg'), sensor_data.rgb)
             cv2.imwrite(os.path.join(route_dir, 'rgb_augmented',
-                        f'{frame_str}.jpg'), sensor_data.rgb)
+                        f'{frame_str}.jpg'), sensor_data.rgb_augmented)
 
-            # Semantics + augmented
+            # Semantics (normal + augmented)
             cv2.imwrite(os.path.join(route_dir, 'semantics',
                         f'{frame_str}.png'), sensor_data.semantics)
             cv2.imwrite(os.path.join(route_dir, 'semantics_augmented',
-                        f'{frame_str}.png'), sensor_data.semantics)
+                        f'{frame_str}.png'), sensor_data.semantics_augmented)
 
-            # Depth + augmented
+            # Depth (normal + augmented)
+            depth_aug_raw = sensor_data.depth_augmented.copy()
+            depth_aug_encoded = (convert_depth(depth_aug_raw) * 255.0 + 0.5
+                                 ).astype(np.uint8)
             cv2.imwrite(os.path.join(route_dir, 'depth',
                         f'{frame_str}.png'), depth_encoded)
             cv2.imwrite(os.path.join(route_dir, 'depth_augmented',
-                        f'{frame_str}.png'), depth_encoded)
+                        f'{frame_str}.png'), depth_aug_encoded)
 
-            # BEV semantics + augmented
+            # BEV semantics + augmented (BEV is top-down, not affected by camera shift)
             cv2.imwrite(os.path.join(route_dir, 'bev_semantics',
                         f'{frame_str}.png'), sensor_data.bev_semantics)
             cv2.imwrite(os.path.join(route_dir, 'bev_semantics_augmented',
@@ -1030,8 +1159,12 @@ def collect_route(world, vehicle, route_dir, route_planner,
                           f'[{dense_route[2][0]:+.1f},{dense_route[2][1]:+.1f}] '
                           f'({"AHEAD" if dense_route[2][0] > 0 else "BEHIND!!"})')
                 print(f'      sem_tags: {_sem_str}')
-                print(f'      cmd={int(cmd)} junct={wp_on_junction} '
-                      f'tgt_spd={target_speed:.1f} brk={brake}')
+                _cmd_names = {1:'LEFT', 2:'RIGHT', 3:'STRAIGHT', 4:'FOLLOW'}
+                print(f'      cmd={int(cmd)}({_cmd_names.get(int(cmd),"?")}) '
+                      f'junct={wp_on_junction} '
+                      f'tgt_spd={target_speed:.1f} brk={brake} '
+                      f'aug_t={aug_translation_buf[0]:+.2f}m '
+                      f'aug_r={aug_rotation_buf[0]:+.1f}deg')
 
             # End route conditions
             if route_planner.is_route_complete() and \
@@ -1133,7 +1266,8 @@ def run_collection(args):
             shuffle_weather(world, ego_vehicle)
 
             # Plan a route
-            planner = RoutePlanner(world, ego_vehicle)
+            planner = RoutePlanner(world, ego_vehicle,
+                                    traffic_manager=tm)
             if len(planner.route) < 30:
                 ego_vehicle.destroy()
                 ego_vehicle = None
