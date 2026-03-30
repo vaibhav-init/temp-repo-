@@ -298,89 +298,89 @@ class RoutePlanner:
         self.route = []           # list of (carla.Waypoint, RoadOption)
         self.route_index = 0
         self._target_road_option = RoadOption.LANEFOLLOW
+        self._diverged = False
         self._generate_route()
 
     # ------------------------------------------------------------------
     def _generate_route(self):
-        """Build a long route by chaining random destinations via GRP."""
+        """Find a single long, continuous route via GRP."""
         spawn_points = self.map.get_spawn_points()
         self.route = []
         current_loc = self.vehicle.get_location()
-        for _ in range(5):                       # chain 5 random legs
+        
+        # Try multiple times to find a long route
+        for _ in range(20):
             dest = random.choice(spawn_points).location
             try:
                 segment = self.grp.trace_route(current_loc, dest)
-                if segment:
-                    self.route.extend(segment)
-                    current_loc = segment[-1][0].transform.location
+                if segment and len(segment) > 150:  # > 300m route
+                    self.route = segment
+                    break
             except Exception:
                 continue
+        
         self.route_index = 0
         self._set_tm_path()
 
     def _extend_route(self):
-        """Append a new random leg when the route runs low."""
-        spawn_points = self.map.get_spawn_points()
-        if self.route:
-            current_loc = self.route[-1][0].transform.location
-        else:
-            current_loc = self.vehicle.get_location()
-        for _ in range(3):
-            dest = random.choice(spawn_points).location
-            try:
-                segment = self.grp.trace_route(current_loc, dest)
-                if segment:
-                    self.route.extend(segment)
-                    current_loc = segment[-1][0].transform.location
-                    break
-            except Exception:
-                continue
-        self._set_tm_path()
+        """Do nothing. We only use the single continuous route."""
+        pass
 
     def _set_tm_path(self):
         """Tell the traffic-manager autopilot to follow our route."""
         if self.traffic_manager is None or not self.route:
             return
-        remaining = self.route[self.route_index:]
-        path = [wp.transform.location for wp, _ in remaining]
+        # Pass the remaining path locations to TM
+        path = [wp.transform.location for wp, _ in self.route]
         try:
             self.traffic_manager.set_path(self.vehicle, path)
         except Exception as e:
-            # set_path may not exist in every CARLA build
-            print(f'  [INFO] TM set_path unavailable ({e}), '
-                  'autopilot will use its own route.')
+            print(f'  [INFO] TM set_path unavailable ({e}).')
 
     # ------------------------------------------------------------------
     def _advance_index(self):
         """Snap route_index to the closest waypoint to the vehicle."""
+        if self._diverged or self.route_index >= len(self.route):
+            return
+
         loc = self.vehicle.get_location()
         min_dist = float('inf')
         min_idx = self.route_index
         search_end = min(self.route_index + 40, len(self.route))
+        
         for i in range(self.route_index, search_end):
             d = loc.distance(self.route[i][0].transform.location)
             if d < min_dist:
                 min_dist = d
                 min_idx = i
+                
+        # If the car naturally progressed, snap to it
         if min_dist < 4.0:
             self.route_index = min_idx + 1
         else:
             self.route_index = min_idx
+            
+        # Detect if the TM disobeyed the set_path and wandered off!
+        # If the car is > 5.0m away from its expected route snippet, it diverged.
+        if min_dist > 5.0:
+            print(f"  [ROUTE] EGO vehicle diverged from path! (dist={min_dist:.1f}m)")
+            self._diverged = True
 
     # ------------------------------------------------------------------
     def get_next_waypoints(self, n=20):
         """Return the next *n* carla.Waypoint objects (no RoadOption)."""
         self._advance_index()
-        if len(self.route) - self.route_index < n + 10:
-            self._extend_route()
+        if self._diverged:
+            return []
         end = min(self.route_index + n, len(self.route))
         return [wp for wp, _ in self.route[self.route_index:end]]
 
     def get_target_point(self):
         """Far target point (~20 m ahead, index 9)."""
         self._advance_index()
-        if len(self.route) - self.route_index < 15:
-            self._extend_route()
+        if self._diverged or self.route_index >= len(self.route)-1:
+            return self.route[-1][0] if self.route else None
+            
         idx = min(self.route_index + 9, len(self.route) - 1)
         wp, road_option = self.route[idx]
         self._target_road_option = road_option
@@ -395,7 +395,8 @@ class RoutePlanner:
         return 4  # LANEFOLLOW, CHANGELANELEFT, CHANGELANERIGHT, VOID
 
     def is_route_complete(self):
-        return self.route_index >= len(self.route) - 5
+        """End route if completed OR if the TM wandered off."""
+        return self._diverged or self.route_index >= len(self.route) - 5
 
 
 # ============================================================================
