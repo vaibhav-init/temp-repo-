@@ -50,7 +50,10 @@ def convert_sem_lidar_2D_img_func(sim_radar, invert_angle, limit = 75):
     # with open(glob.glob('../carla_garage_radar/team_code/e2e_agent_sem_lidar2shenron_package/simulator_configs.yaml'), 'r') as f:
     #     sim_config = yaml.safe_load(f)
     
-    with open('/radar-imaging-dataset/carla_garage_radar/team_code/e2e_agent_sem_lidar2shenron_package/simulator_configs.yaml', 'r') as f:
+    # Resolve config relative to the actual package location (not hardcoded research server path)
+    _pkg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'e2e_agent_sem_lidar2shenron_package')
+    _config_path = os.path.join(_pkg_dir, 'simulator_configs.yaml')
+    with open(_config_path, 'r') as f:
         sim_config = yaml.safe_load(f)
     
     sim_config['INVERT_ANGLE'] = invert_angle

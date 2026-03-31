@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# C-Shenron Training Script — Single RTX 3060 (12GB VRAM)
+# C-Shenron Training Script — Single GPU
 # ============================================================================
 # Usage:  bash shell_train_local.sh
 # Run from:  C-Shenron/team_code/
@@ -13,6 +13,7 @@ export CUDA_VISIBLE_DEVICES=0     # Single GPU
 
 # ---- Experiment Config ----
 export TRAIN_ID=cshenron_town01_radar_v1
+
 
 # ---- Paths (EDIT THESE FOR YOUR UBUNTU MACHINE) ----
 ROOT_DIR="/storage/dataset"                      # Where data_collector_v2.py saved data
@@ -31,7 +32,7 @@ echo "=============================================="
 
 # ---- Launch Training ----
 # torchrun with nproc_per_node=1 for single GPU
-# batch_size=2 is safe for 12GB VRAM with TransFuser-CR backbone
+# batch_size=4 is a safe starting point; reduce to 2 if OOM, increase to 8/12 if you have more VRAM
 # radar_cat=1 = Front+Back radar concatenation (what we generated)
 # radar_channels=1 = Use Shenron simulated radar (not CARLA native)
 # setting=all = Train on all data, no validation split (we only have Town01)
@@ -45,7 +46,7 @@ torchrun \
     train.py \
     --id ${TRAIN_ID} \
     --epochs 30 \
-    --batch_size 2 \
+    --batch_size 4 \
     --setting all \
     --root_dir ${ROOT_DIR} \
     --logdir ${LOGDIR} \
@@ -53,13 +54,13 @@ torchrun \
     --use_wp_gru 0 \
     --use_discrete_command 1 \
     --use_tp 1 \
-    --continue_epoch 1 \
-    --load_file /storage/training_logs/cshenron_town01_radar_v1/model_0005.pth \
+    --continue_epoch 0 \
     --cpu_cores 8 \
     --num_repetitions 1 \
     --use_disk_cache 0 \
     --radar_channels 1 \
     --radar_cat 1 \
+    --augment 1 \
     2>&1 | tee ${LOGDIR}/training_logs/${TRAIN_ID}.log
 
 echo ""
