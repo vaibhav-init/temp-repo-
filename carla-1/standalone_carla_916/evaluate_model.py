@@ -45,14 +45,10 @@ sys.path.insert(0, os.path.join(TEAM_CODE_DIR, 'e2e_agent_sem_lidar2shenron_pack
 from model import LidarCenterNet
 from config import GlobalConfig
 from mask import generate_mask
-import yaml
-from e2e_agent_sem_lidar2shenron_package.lidar import run_lidar
-from sim_radar_utils.radar_processor import RadarProcessor
-from sim_radar_utils.utils_radar import reformat_adc_shenron
-from sim_radar_utils.transform_utils import polar_to_cart, get_range_angle
+from sim_radar_utils.convert2D_img import convert_sem_lidar_2D_img_func
 import transfuser_utils as t_u
+from nav_planner import RoutePlanner
 from agents.navigation.global_route_planner import GlobalRoutePlanner
-from agents.navigation.local_planner import RoadOption
 
 # UKF for GPS filtering
 from filterpy.kalman import MerweScaledSigmaPoints
@@ -64,28 +60,8 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.allow_tf32 = True
 
-# Radar mask
+# Radar mask (matches C-Shenron sensor_agent.py)
 mask_for_radar = generate_mask(shape=256, start_angle=35, fov_degrees=110, end_mag=0)
-
-# ============================================================
-#  Local Radar Synthesis (Bypasses remote convert2D_img hardcoded path)
-# ============================================================
-def local_convert_sem_lidar_2D_img_func(sim_radar, invert_angle, limit=75):
-    config_path = os.path.join(TEAM_CODE_DIR, 'e2e_agent_sem_lidar2shenron_package', 'simulator_configs.yaml')
-    with open(config_path, 'r') as f:
-        sim_config = yaml.safe_load(f)
-    
-    sim_config['INVERT_ANGLE'] = invert_angle
-    
-    radar = run_lidar(sim_config, sim_radar)
-    radarProcessor = RadarProcessor()
-    
-    chirpLevelData = reformat_adc_shenron(radar)
-    rangeProfile = radarProcessor.cal_range_fft(chirpLevelData)
-    aoaProfile = radarProcessor.cal_angle_fft(rangeProfile)
-    range_angle = get_range_angle(aoaProfile)
-    cart_cord = polar_to_cart(range_angle, limit=limit)
-    return cart_cord
 
 # ============================================================
 #  Default paths for the IIITD Ubuntu system
@@ -218,13 +194,6 @@ def _normalize_state_dict(raw_checkpoint):
     return normalized
 
 
-def crop256X256(radar_cat):
-    center_x, center_y = radar_cat.shape[1] // 2, radar_cat.shape[0] // 2
-    crop_size = 256
-    return radar_cat[center_y - crop_size // 2:center_y + crop_size // 2,
-                     center_x - crop_size // 2:center_x + crop_size // 2]
-
-
 # ============================================================
 #  UKF Helper Functions
 # ============================================================
@@ -281,7 +250,6 @@ class ShenronEvalAgent:
             radar_cat:        0=front only, 1=front+back, 2=all 4 directions
         """
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.radar_cat = radar_cat
         self.step = 0
         self.config = config
         self.config.debug = False
@@ -314,6 +282,16 @@ class ShenronEvalAgent:
         self.net = net
         print("Model loaded successfully!")
 
+        # Match sensor_agent / map_agent: brake threshold from env (optional)
+        self.config.brake_uncertainty_threshold = float(
+            os.environ.get('UNCERTAINTY_THRESHOLD', str(self.config.brake_uncertainty_threshold)))
+
+        self.config.radar_cat = int(radar_cat)
+
+        # C-Shenron nav_planner.RoutePlanner (set via attach_route_planner before driving)
+        self._route_planner = None
+        self.last_nav_command = 4
+
         # Initialize UKF
         points = MerweScaledSigmaPoints(n=4, alpha=0.00001, beta=2, kappa=0, subtract=self.residual_state_x)
         self.ukf = UKF(dim_x=4, dim_z=4, fx=bicycle_model_predict, hx=measurement_function,
@@ -325,14 +303,11 @@ class ShenronEvalAgent:
         self.ukf.Q = np.diag([0.0001, 0.0001, 0.001, 0.001])
         self.filter_initialized = False
 
-        # State tracking
-        self.state_log = deque(maxlen=max((self.config.lidar_seq_len * self.config.data_save_freq + 1), 20))
-        self.config.data_save_freq = 5
+        # State tracking (matches sensor_agent.py; use data_save_freq from training config)
+        self.state_log = deque(maxlen=max((self.config.lidar_seq_len * self.config.data_save_freq), 2))
 
-        # PID tuning overrides removed to preserve proper configuration loaded from training.
-
-        self.lidar_buffer = deque(maxlen=self.config.lidar_seq_len * self.config.data_save_freq + 1)
-        self.semantic_lidar_buffer = deque(maxlen=self.config.lidar_seq_len * self.config.data_save_freq + 1)
+        self.lidar_buffer = deque(maxlen=self.config.lidar_seq_len * self.config.data_save_freq)
+        self.semantic_lidar_buffer = deque(maxlen=self.config.lidar_seq_len * self.config.data_save_freq)
 
         self.lidar_last = None
         self.semantic_lidar_last = None
@@ -343,7 +318,6 @@ class ShenronEvalAgent:
         # Stuck detection
         self.stuck_detector = 0
         self.force_move = 0
-        self.has_started = False
 
         # Target point tracking
         self.target_point_prev = np.array([0, 0])
@@ -353,6 +327,10 @@ class ShenronEvalAgent:
 
         # Uncertainty weight
         self.uncertainty_weight = int(os.environ.get('UNCERTAINTY_WEIGHT', 1))
+
+    def attach_route_planner(self, route_planner):
+        """Attach C-Shenron ``nav_planner.RoutePlanner`` (same as ``sensor_agent._route_planner``)."""
+        self._route_planner = route_planner
 
     # ============================================================
     #  UKF helper methods
@@ -416,65 +394,71 @@ class ShenronEvalAgent:
     #  Main inference step
     # ============================================================
     @torch.inference_mode()
-    def run_step(self, rgb_image, lidar_data, semantic_lidar_data, gps, speed, compass, target_point, nav_command):
+    def run_step(self, rgb_image, lidar_data, semantic_lidar_data, gps_carla_from_gnss, speed, compass):
         """
-        Main inference step.
+        Main inference step (aligned with ``sensor_agent.run_step`` / ``tick``).
 
         Args:
             rgb_image: (H, W, 3) BGR camera image
             lidar_data: (N, 4) lidar points [x, y, z, intensity]
             semantic_lidar_data: (N, 6) semantic lidar [x, y, z, cosine, index, tag]
-            gps: (2,) GPS position [x, y] in CARLA coordinates
+            gps_carla_from_gnss: (2,) position from ``RoutePlanner.convert_gps_to_carla(lat, lon)``
             speed: float, vehicle speed m/s
-            compass: float, vehicle heading in radians
-            target_point: (2,) target waypoint [x, y] in global CARLA coordinates
-
-        Returns:
-            carla.VehicleControl
+            compass: IMU compass (rad); preprocess with ``preprocess_compass`` before passing
         """
         self.step += 1
         if self.step % 10 == 0:
             print(f"\n--- Step {self.step} | speed={speed:.2f} m/s | lidar_buf={len(self.lidar_buffer)} ---")
 
-        # ---- Process RGB ----
+        if self._route_planner is None:
+            raise RuntimeError("Call agent.attach_route_planner(RoutePlanner) before run_step.")
+
+        # ---- Process RGB (matches sensor_agent.tick) ----
         _, compressed = cv2.imencode('.jpg', rgb_image)
         camera = cv2.imdecode(compressed, cv2.IMREAD_UNCHANGED)
         rgb = cv2.cvtColor(camera, cv2.COLOR_BGR2RGB)
         rgb = np.transpose(rgb, (2, 0, 1))
         rgb = torch.from_numpy(rgb).to(self.device, dtype=torch.float32).unsqueeze(0)
 
-        # ---- Process LiDAR / Semantic Lidar to Ego Frame ----
+        # ---- LiDAR / semantic LiDAR → ego ----
         lidar_data = t_u.lidar_to_ego_coordinate(self.config, [None, lidar_data])
         semantic_lidar_data = t_u.semantic_lidar_to_ego_coordinate(self.config, [None, semantic_lidar_data])
 
-        # ---- UKF Filter ----
+        # ---- UKF (measurements: GNSS→CARLA xy + preprocessed compass) ----
         compass = t_u.normalize_angle(compass)
         if not self.filter_initialized:
-            self.ukf.x = np.array([gps[0], gps[1], compass, speed])
+            self.ukf.x = np.array([gps_carla_from_gnss[0], gps_carla_from_gnss[1], compass, speed])
             self.filter_initialized = True
 
         self.ukf.predict(steer=self.control.steer, throttle=self.control.throttle, brake=self.control.brake)
-        self.ukf.update(np.array([gps[0], gps[1], compass, speed]))
+        self.ukf.update(np.array([gps_carla_from_gnss[0], gps_carla_from_gnss[1], compass, speed]))
         filtered_state = self.ukf.x
         self.state_log.append(filtered_state)
 
-        # ---- Navigation Command ----
-        one_hot_command = t_u.command_to_one_hot(nav_command)
+        # ---- Route + command (matches sensor_agent.tick) ----
+        waypoint_route = self._route_planner.run_step(np.array([filtered_state[0], filtered_state[1]]))
+        if len(waypoint_route) > 2:
+            target_point, far_command = waypoint_route[1]
+        elif len(waypoint_route) > 1:
+            target_point, far_command = waypoint_route[1]
+        else:
+            target_point, far_command = waypoint_route[0]
+
+        if (target_point != self.target_point_prev).all():
+            self.target_point_prev = target_point.copy()
+            self.commands.append(far_command.value)
+
+        self.last_nav_command = self.commands[-2]
+        one_hot_command = t_u.command_to_one_hot(self.last_nav_command)
         command = torch.from_numpy(one_hot_command[np.newaxis]).to(self.device, dtype=torch.float32)
 
-        # ---- Target Point ----
-        # Training data (data_collector_v2.py) used the preprocessed compass (theta = yaw - 90°)
-        # directly in inverse_conversion_2d. filtered_state[2] already holds that same
-        # preprocessed value, so we must NOT add pi/2 back.
-        ego_target = t_u.inverse_conversion_2d(target_point, filtered_state[0:2],
-                                               filtered_state[2])
+        ego_target = t_u.inverse_conversion_2d(target_point, filtered_state[0:2], filtered_state[2])
         ego_target = torch.from_numpy(ego_target[np.newaxis]).to(self.device, dtype=torch.float32)
 
-        # ---- Speed ----
         gt_velocity = torch.FloatTensor([speed]).to(self.device, dtype=torch.float32)
         velocity = gt_velocity.reshape(1, 1)
 
-        # ---- First frame initialization ----
+        # ---- First frame (matches sensor_agent) ----
         if not self.initialized:
             self.lidar_last = deepcopy(lidar_data)
             self.semantic_lidar_last = deepcopy(semantic_lidar_data)
@@ -482,20 +466,15 @@ class ShenronEvalAgent:
             self.control = carla.VehicleControl(steer=0.0, throttle=0.0, brake=1.0)
             return self.control
 
-        # ---- Align and concatenate lidar ----
-        if len(self.state_log) >= 2:
-            ego_x, ego_y, ego_theta = filtered_state[0], filtered_state[1], filtered_state[2]
-            ego_x_last = self.state_log[-2][0]
-            ego_y_last = self.state_log[-2][1]
-            ego_theta_last = self.state_log[-2][2]
+        ego_x, ego_y, ego_theta = filtered_state[0], filtered_state[1], filtered_state[2]
+        ego_x_last = self.state_log[-2][0]
+        ego_y_last = self.state_log[-2][1]
+        ego_theta_last = self.state_log[-2][2]
 
-            lidar_last_aligned = self.align_lidar(self.lidar_last, ego_x_last, ego_y_last, ego_theta_last,
-                                                   ego_x, ego_y, ego_theta)
-            sem_lidar_last_aligned = self.align_semantic_lidar(self.semantic_lidar_last, ego_x_last, ego_y_last,
-                                                                ego_theta_last, ego_x, ego_y, ego_theta)
-        else:
-            lidar_last_aligned = self.lidar_last
-            sem_lidar_last_aligned = self.semantic_lidar_last
+        lidar_last_aligned = self.align_lidar(
+            self.lidar_last, ego_x_last, ego_y_last, ego_theta_last, ego_x, ego_y, ego_theta)
+        sem_lidar_last_aligned = self.align_semantic_lidar(
+            self.semantic_lidar_last, ego_x_last, ego_y_last, ego_theta_last, ego_x, ego_y, ego_theta)
 
         lidar_full = np.concatenate((lidar_data, lidar_last_aligned), axis=0)
         sem_lidar_full = np.concatenate((semantic_lidar_data, sem_lidar_last_aligned), axis=0)
@@ -503,7 +482,6 @@ class ShenronEvalAgent:
         self.lidar_buffer.append(lidar_full)
         self.semantic_lidar_buffer.append(sem_lidar_full)
 
-        # Wait for enough lidar frames
         needed = self.config.lidar_seq_len * self.config.data_save_freq
         if len(self.lidar_buffer) < needed:
             print(f"  [WAIT] Filling lidar buffer: {len(self.lidar_buffer)}/{needed}")
@@ -512,62 +490,79 @@ class ShenronEvalAgent:
             self.control = carla.VehicleControl(0.0, 0.0, 1.0)
             return self.control
 
-        # Action repeat
         if self.step % self.config.action_repeat == 1:
             self.lidar_last = deepcopy(lidar_data)
             self.semantic_lidar_last = deepcopy(semantic_lidar_data)
             return self.control
 
-        # ---- Create LiDAR BEV + Radar ----
-        lidar_indices = [-((self.config.lidar_seq_len - 1 - i) * self.config.data_save_freq + 1) for i in range(self.config.lidar_seq_len)]
+        lidar_indices = [i * self.config.data_save_freq for i in range(self.config.lidar_seq_len)]
         radar_list = []
         lidar_bev_list = []
 
         for i in lidar_indices:
-            lidar_pc = deepcopy(self.lidar_buffer[i])
+            lidar_point_cloud = deepcopy(self.lidar_buffer[i])
+
+            if self.config.realign_lidar and self.config.lidar_seq_len > 1:
+                curr_x = self.state_log[i][0]
+                curr_y = self.state_log[i][1]
+                curr_theta = self.state_log[i][2]
+                lidar_point_cloud = self.align_lidar(
+                    lidar_point_cloud, curr_x, curr_y, curr_theta, ego_x, ego_y, ego_theta)
+
             lidar_histogram = torch.from_numpy(
-                self.data.lidar_to_histogram_features(lidar_pc, use_ground_plane=self.config.use_ground_plane)
+                self.data.lidar_to_histogram_features(
+                    lidar_point_cloud, use_ground_plane=self.config.use_ground_plane)
             ).unsqueeze(0).to(self.device, dtype=torch.float32)
             lidar_bev_list.append(lidar_histogram)
 
-            # Process radar from semantic lidar.
-            # If radar synthesis OOMs, fall back to zero radar so the episode can continue.
             raw_radar = deepcopy(self.semantic_lidar_buffer[i])
             try:
-                radar_np = local_convert_sem_lidar_2D_img_func(raw_radar, 0)
+                radar_np = convert_sem_lidar_2D_img_func(raw_radar, 0)
 
-                if self.radar_cat == 1:
-                    radar_np_back = local_convert_sem_lidar_2D_img_func(raw_radar, 180)
+                radar_channel = int(os.environ.get('RADAR_CHANNEL', '1'))
+                if radar_channel == 2:
+                    radar_np_back = convert_sem_lidar_2D_img_func(raw_radar, 180)
+                    radar_np = np.stack((radar_np, radar_np_back), axis=0)
+
+                if self.config.radar_cat == 1:
+                    radar_np_back = convert_sem_lidar_2D_img_func(raw_radar, 180)
+                    radar_np = radar_np * mask_for_radar
+                    radar_np_back = radar_np_back * mask_for_radar
                     radar_np_back = np.rot90(np.rot90(radar_np_back))
-                    radar_cat_np = np.concatenate((radar_np, radar_np_back), axis=0)
-                    
-                    center_x, center_y = radar_cat_np.shape[1] // 2, radar_cat_np.shape[0] // 2
-                    crop_size = 256
-                    radar_np = radar_cat_np[center_y - crop_size // 2:center_y + crop_size // 2,
-                                            center_x - crop_size // 2:center_x + crop_size // 2]
-                elif self.radar_cat == 2:
-                    radar_np_back = local_convert_sem_lidar_2D_img_func(raw_radar, 180)
-                    radar_np_left = local_convert_sem_lidar_2D_img_func(raw_radar, 270)
-                    radar_np_right = local_convert_sem_lidar_2D_img_func(raw_radar, 90)
-                    
-                    radar_np = crop256X256(radar_np) * mask_for_radar
-                    radar_np_back = crop256X256(radar_np_back) * mask_for_radar
-                    radar_np_left = crop256X256(radar_np_left) * mask_for_radar
-                    radar_np_right = crop256X256(radar_np_right) * mask_for_radar
-                    
+                    radar_np = radar_np + radar_np_back
+
+                if self.config.radar_cat == 2:
+                    radar_np_back = convert_sem_lidar_2D_img_func(raw_radar, 180)
+                    radar_np_left = convert_sem_lidar_2D_img_func(raw_radar, 270)
+                    radar_np_right = convert_sem_lidar_2D_img_func(raw_radar, 90)
+                    radar_np = radar_np * mask_for_radar
+                    radar_np_back = radar_np_back * mask_for_radar
+                    radar_np_left = radar_np_left * mask_for_radar
+                    radar_np_right = radar_np_right * mask_for_radar
                     radar_np_left = np.rot90(radar_np_left)
                     radar_np_back = np.rot90(np.rot90(radar_np_back))
                     radar_np_right = np.rot90(np.rot90(np.rot90(radar_np_right)))
                     radar_np = radar_np + radar_np_back + radar_np_left + radar_np_right
+
+                if int(os.environ.get('DB_ON', 0)):
+                    radar_np = np.log(radar_np + 1e-10)
+                if int(os.environ.get('BLACKOUT_RADAR', 0)):
+                    radar_np = np.zeros((256, 256))
+
+                if radar_channel <= 1:
+                    radar_np_exp = np.expand_dims(radar_np, axis=2)
+                    radar_np_exp = np.transpose(radar_np_exp, (2, 0, 1))
                 else:
-                    radar_np = crop256X256(radar_np)
+                    radar_np_exp = radar_np
             except torch.OutOfMemoryError:
                 self.radar_fallback_count += 1
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 if self.radar_fallback_count == 1 or self.radar_fallback_count % 20 == 0:
                     print(f"  [WARN] Radar synthesis OOM (count={self.radar_fallback_count}). Using zero radar fallback.")
-                radar_np = np.zeros((256, 256), dtype=np.float32)
+                z = np.zeros((256, 256), dtype=np.float32)
+                radar_np_exp = np.expand_dims(z, axis=2)
+                radar_np_exp = np.transpose(radar_np_exp, (2, 0, 1))
             except RuntimeError as exc:
                 if 'out of memory' in str(exc).lower():
                     self.radar_fallback_count += 1
@@ -575,20 +570,18 @@ class ShenronEvalAgent:
                         torch.cuda.empty_cache()
                     if self.radar_fallback_count == 1 or self.radar_fallback_count % 20 == 0:
                         print(f"  [WARN] Radar synthesis OOM (count={self.radar_fallback_count}). Using zero radar fallback.")
-                    radar_np = np.zeros((256, 256), dtype=np.float32)
+                    z = np.zeros((256, 256), dtype=np.float32)
+                    radar_np_exp = np.expand_dims(z, axis=2)
+                    radar_np_exp = np.transpose(radar_np_exp, (2, 0, 1))
                 else:
                     raise
 
-            radar_np_exp = np.expand_dims(radar_np, axis=2)
-            radar_np_exp = np.transpose(radar_np_exp, (2, 0, 1))
             radar = torch.from_numpy(radar_np_exp).to(self.device, dtype=torch.float32).unsqueeze(0)
             radar_list.append(radar)
 
         radar_tensor = torch.cat(radar_list, dim=1)
-        # Concatenate lidar BEV histograms along channel dim (matches training data loader)
         lidar_bev = torch.cat(lidar_bev_list, dim=1)
 
-        # ---- Model Forward Pass ----
         pred_wp, pred_target_speed, pred_checkpoint, \
         pred_semantic, pred_bev_semantic, pred_depth, \
         pred_bb_features, attention_weights, pred_wp_1, \
@@ -600,7 +593,9 @@ class ShenronEvalAgent:
             ego_vel=velocity,
             command=command)
 
-        # ---- Waypoint Selection ----
+        pred_angle = 0.0
+        target_speed = 0.0
+
         if self.config.use_wp_gru:
             if self.config.multi_wp_output:
                 if F.sigmoid(selected_path)[0].item() > 0.5:
@@ -608,12 +603,9 @@ class ShenronEvalAgent:
             self.pred_wp = pred_wp
             self.predicted_waypoints_ego = pred_wp[0, :, :2].cpu().numpy()
 
-        # ---- Speed Control ----
         if self.config.use_controller_input_prediction:
             pred_target_speed_probs = F.softmax(pred_target_speed[0], dim=0)
             pred_aim_wp = pred_checkpoint[0][1].detach().cpu().numpy()
-            # Ego-local convention: [0]=forward (X), [1]=lateral (Y)
-            # Matches C-Shenron autopilot.py _get_angle_to() and data_collector_v2.py
             pred_angle = -math.degrees(math.atan2(-pred_aim_wp[1], pred_aim_wp[0])) / 90.0
 
             if self.uncertainty_weight:
@@ -622,62 +614,63 @@ class ShenronEvalAgent:
                     print(f"  [DEBUG] uncertainty={uncertainty}")
                     print(f"  [DEBUG] target_speeds={self.config.target_speeds}")
                     print(f"  [DEBUG] ego_target={ego_target.cpu().numpy()[0]}, pred_aim_wp={pred_aim_wp}, pred_angle={pred_angle:.3f}")
-                # Match C-Shenron logic: only hard stop if uncertainty for bin 0 exceeds a high threshold
-                if uncertainty[0] > getattr(self.config, 'brake_uncertainty_threshold', 0.95):
+                if uncertainty[0] > self.config.brake_uncertainty_threshold:
                     target_speed = self.config.target_speeds[0]
                 else:
-                    target_speed = sum(uncertainty * self.config.target_speeds)
-
+                    target_speed = float(np.sum(uncertainty * np.array(self.config.target_speeds)))
             else:
-                idx = torch.argmax(pred_target_speed_probs)
+                idx = int(torch.argmax(pred_target_speed_probs).item())
                 target_speed = self.config.target_speeds[idx]
-            
-            # HARDCODE OVERRIDE: cap speed at 3.0 m/s for stable turning, but allow stopping!
-            target_speed = min(target_speed, 3.0)
 
-        # ---- Stuck Detection (before PID so force_move can skip PID to prevent windup) ----
-        # Grace period: model always predicts stop from standstill; don't count until warmup is done.
-        # ---- Stuck Detection (Standard TransFuser/C-Shenron Implementation) ----
-        # In the original C-Shenron `sensor_agent.py`, they DO NOT use 'wants_to_move'. 
-        # They increment `stuck_detector` unconditionally whenever speed < 0.1m/s.
-        # This is exactly how they break the neural network's causal confusion at green lights & spawn.
-        if speed < 0.1 and self.step > 20:
+        if self.config.inference_direct_controller and self.config.use_controller_input_prediction:
+            steer, throttle, brake = self.net.control_pid_direct(target_speed, pred_angle, gt_velocity)
+        elif self.config.use_wp_gru and not self.config.inference_direct_controller:
+            steer, throttle, brake = self.net.control_pid(self.pred_wp, gt_velocity)
+        else:
+            raise ValueError(
+                'Control path mismatch (see sensor_agent.py): use '
+                '(inference_direct_controller + use_controller_input_prediction) or '
+                '(use_wp_gru and not inference_direct_controller).')
+
+        # Stuck + creep (matches sensor_agent.py)
+        if gt_velocity.item() < 0.1:
             self.stuck_detector += 1
         else:
             self.stuck_detector = 0
 
-        actual_stuck_threshold = min(self.config.stuck_threshold, 40)
-        if self.stuck_detector > actual_stuck_threshold and self.force_move == 0:
-            self.force_move = max(self.config.creep_duration, 60)
+        if self.stuck_detector > self.config.stuck_threshold:
+            self.force_move = int(self.config.creep_duration)
 
-        # ---- PID Control ----
         if self.force_move > 0:
-            # Standard TransFuser creep: override throttle but keep native steering (NO WIGGLES)
-            print(f'  [STUCK] TransFuser Force creeping! Step: {self.step}')
-            steer = float(pred_angle) if self.config.use_controller_input_prediction else 0.0
-            throttle = max(self.config.creep_throttle, 0.5)
-            brake = False
-            self.force_move -= 1
-            self.stuck_detector = 0
-            
-            # Reset turn-controller integral windup smoothly
-            win = self.net.turn_controller_direct.window if self.config.use_controller_input_prediction else self.net.turn_controller.window
-            for i in range(len(win)): win[i] = 0.0
+            emergency_stop = False
+            if self.config.backbone != 'aim':
+                safety_box = deepcopy(self.lidar_buffer[-1])
+                safety_box = safety_box[safety_box[..., 2] > self.config.safety_box_z_min]
+                safety_box = safety_box[safety_box[..., 2] < self.config.safety_box_z_max]
+                safety_box = safety_box[safety_box[..., 1] > self.config.safety_box_y_min]
+                safety_box = safety_box[safety_box[..., 1] < self.config.safety_box_y_max]
+                safety_box = safety_box[safety_box[..., 0] > self.config.safety_box_x_min]
+                safety_box = safety_box[safety_box[..., 0] < self.config.safety_box_x_max]
+                emergency_stop = len(safety_box) > 0
 
-        elif self.config.use_controller_input_prediction:
-            steer, throttle, brake = self.net.control_pid_direct(target_speed, pred_angle, gt_velocity)
-        elif self.config.use_wp_gru:
-            steer, throttle, brake = self.net.control_pid(self.pred_wp, gt_velocity)
-        else:
-            steer, throttle, brake = 0.0, 0.0, 1.0
-
+            if not emergency_stop:
+                print(f'  [STUCK] Detected agent being stuck. Step: {self.step}')
+                throttle = max(self.config.creep_throttle, throttle)
+                brake = False
+                self.force_move -= 1
+                self.stuck_detector = 0
+            else:
+                print('  [STUCK] Creeping stopped by safety box.')
+                throttle = 0.0
+                brake = True
+                self.force_move = int(self.config.creep_duration)
 
         self.lidar_last = deepcopy(lidar_data)
         self.semantic_lidar_last = deepcopy(semantic_lidar_data)
 
         control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
 
-        if self.step < 10:  # Short warm-up
+        if self.step < self.config.inital_frames_delay:
             control = carla.VehicleControl(0.0, 0.0, 1.0)
 
         self.control = control
@@ -687,8 +680,12 @@ class ShenronEvalAgent:
 # ============================================================
 #  CARLA Helper Functions
 # ============================================================
-def setup_carla(host='localhost', port=2000, town='Town01', weather='ClearNoon'):
-    """Connect to CARLA, load the world, and set weather."""
+def setup_carla(host='localhost', port=2000, town='Town01', weather='ClearNoon', fog_density=None):
+    """Connect to CARLA, load the world, and set weather.
+
+    If fog_density is set (e.g. 40.0), applies the same fog overlay as optional training-style weather.
+    Default None leaves preset weather unchanged (neutral eval).
+    """
     client = carla.Client(host, port)
     client.set_timeout(30.0)
     world = client.load_world(town)
@@ -702,13 +699,13 @@ def setup_carla(host='localhost', port=2000, town='Town01', weather='ClearNoon')
         print("Falling back to ClearNoon")
         world.set_weather(carla.WeatherParameters.ClearNoon)
 
-    # Overlay fog to match training data conditions (~40% fog density)
-    current_weather = world.get_weather()
-    current_weather.fog_density = 40.0
-    current_weather.fog_distance = 50.0
-    current_weather.fog_falloff = 1.0
-    world.set_weather(current_weather)
-    print(f"Fog overlay applied: density=40%, distance=50m")
+    if fog_density is not None and fog_density > 0:
+        current_weather = world.get_weather()
+        current_weather.fog_density = float(fog_density)
+        current_weather.fog_distance = 50.0
+        current_weather.fog_falloff = 1.0
+        world.set_weather(current_weather)
+        print(f"Fog overlay applied: density={fog_density}%, distance=50m")
 
     settings = world.get_settings()
     settings.synchronous_mode = True
@@ -969,6 +966,12 @@ Examples:
     parser.add_argument('--spawn-index', type=int, default=None, help='Specific spawn point index')
     parser.add_argument('--sem-lidar-pps', type=int, default=20000,
                         help='Semantic LiDAR points per second used for radar synthesis (lower reduces GPU memory)')
+    parser.add_argument('--fog-density', type=float, default=None,
+                        help='If set (e.g. 40), apply fog overlay on top of weather preset; default=no extra fog')
+    parser.add_argument('--force-green-lights', action='store_true',
+                        help='Force all traffic lights green (not training-neutral)')
+    parser.add_argument('--uncertainty-threshold', type=float, default=None,
+                        help='Override brake uncertainty threshold (same as UNCERTAINTY_THRESHOLD env in sensor_agent)')
     args = parser.parse_args()
 
     # Validate model directory
@@ -983,10 +986,11 @@ Examples:
     checkpoint_path = find_checkpoint(args.model_dir, args.checkpoint)
     print(f"Using checkpoint: {checkpoint_path}")
 
-    # Set environment variables
     os.environ['RADAR_CAT'] = str(args.radar_cat)
     os.environ['RADAR_CHANNEL'] = '1'
     os.environ['UNCERTAINTY_WEIGHT'] = '1'
+    if args.uncertainty_threshold is not None:
+        os.environ['UNCERTAINTY_THRESHOLD'] = str(args.uncertainty_threshold)
 
     actors = []
     npc_vehicle_ids = []
@@ -1009,19 +1013,18 @@ Examples:
 
         # 1. Connect to CARLA
         print("Connecting to CARLA...")
-        client, world, tm = setup_carla(args.host, args.port, args.town, args.weather)
+        client, world, tm = setup_carla(
+            args.host, args.port, args.town, args.weather, fog_density=args.fog_density)
         print(f"Connected! Town: {args.town}")
 
-        # Hack for evaluation: set all traffic lights to Green and freeze them
-        print("Forcing all traffic lights to Green...")
-        traffic_lights = world.get_actors().filter('*traffic_light*')
-        for tl in traffic_lights:
-            tl.set_state(carla.TrafficLightState.Green)
-            tl.set_green_time(99999.0)
+        if args.force_green_lights:
+            print("Forcing all traffic lights to Green (--force-green-lights)...")
+            traffic_lights = world.get_actors().filter('*traffic_light*')
+            for tl in traffic_lights:
+                tl.set_state(carla.TrafficLightState.Green)
+                tl.set_green_time(99999.0)
 
-        # 2. Load agent
         agent = ShenronEvalAgent(config, checkpoint_path, radar_cat=args.radar_cat)
-        agent.config.inital_frames_delay = 10
 
         # 3. Spawn vehicle
         vehicle = spawn_vehicle(world, spawn_index=args.spawn_index)
@@ -1048,11 +1051,18 @@ Examples:
         if args.vehicles > 0 or args.walkers > 0:
             npc_vehicle_ids, walker_ids = spawn_traffic(client, world, tm, args.vehicles, args.walkers)
 
-        # 7. Get map for waypoint queries
         carla_map = world.get_map()
         spawn_points = carla_map.get_spawn_points()
         grp = GlobalRoutePlanner(carla_map, 2.0)
-        current_route = []
+
+        dest = random.choice(spawn_points).location
+        init_trace = grp.trace_route(vehicle.get_transform().location, dest)
+        if len(init_trace) < 4:
+            init_trace = grp.trace_route(spawn_points[0].location, random.choice(spawn_points).location)
+        route_planner = RoutePlanner(
+            agent.config.route_planner_min_distance, agent.config.route_planner_max_distance)
+        route_planner.set_route([(wp.transform, cmd) for wp, cmd in init_trace], False)
+        agent.attach_route_planner(route_planner)
 
         print()
         print("=" * 60)
@@ -1076,58 +1086,30 @@ Examples:
             velocity = vehicle.get_velocity()
             speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
 
-            gps = np.array([transform.location.x, transform.location.y])
-            # Match training precisely: read IMU compass and apply preprocessing (-90° offset)
+            gnss = sensor_data.gnss
+            gps_carla = agent._route_planner.convert_gps_to_carla(
+                np.array([gnss.latitude, gnss.longitude], dtype=np.float64))
             compass = t_u.preprocess_compass(sensor_data.imu.compass)
 
-            # --- Global Route Planner Logic ---
-            # Pop passed waypoints by finding the physically closest point ahead of the car
-            if len(current_route) > 0:
-                min_idx = 0
-                min_dist = float('inf')
-                for idx in range(min(10, len(current_route))):
-                    dist = transform.location.distance(current_route[idx][0].transform.location)
-                    if dist < min_dist:
-                        min_dist = dist
-                        min_idx = idx
-                
-                # If the absolute closest waypoint is under 2.5m, pop it. Otherwise, snap to it.
-                if min_dist < 2.5:
-                    current_route = current_route[min_idx + 1:]
-                else:
-                    current_route = current_route[min_idx:]
-
-            if len(current_route) < 10:
+            if len(agent._route_planner.route) < 15:
                 dest = random.choice(spawn_points).location
-                current_route.extend(grp.trace_route(transform.location, dest))
+                ext_trace = grp.trace_route(transform.location, dest)
+                if len(ext_trace) > 3:
+                    agent._route_planner.set_route([(wp.transform, cmd) for wp, cmd in ext_trace], False)
 
-            # Map RoadOption to Shenron commands (1: LEFT, 2: RIGHT, 3: STRAIGHT, 4: FOLLOW_LANE)
-            def map_command(cmd):
-                if cmd == RoadOption.LEFT: return 1
-                elif cmd == RoadOption.RIGHT: return 2
-                elif cmd == RoadOption.STRAIGHT: return 3
-                else: return 4
+            route_list = list(agent._route_planner.route)
+            for i in range(min(15, len(route_list))):
+                pos, _ = route_list[i]
+                pt = carla.Location(float(pos[0]), float(pos[1]), transform.location.z + 2.0)
+                world.debug.draw_point(pt, size=0.25, color=carla.Color(0, 255, 0), life_time=0.1)
 
-            target_wp1, cmd1 = current_route[min(len(current_route)-1, 9)]
-            target_loc = target_wp1.transform.location
-            target_point = np.array([target_loc.x, target_loc.y])
-            nav_command = map_command(cmd1)
-
-            # --- Live Render CARLA Global Path (Green) ---
-            for i in range(min(15, len(current_route))):
-                pt = current_route[i][0].transform.location
-                world.debug.draw_point(pt + carla.Location(z=2.0), size=0.25, color=carla.Color(0, 255, 0), life_time=0.1)
-
-            # Run agent
             control = agent.run_step(
                 rgb_image=sensor_data.rgb,
                 lidar_data=sensor_data.lidar,
                 semantic_lidar_data=sensor_data.semantic_lidar,
-                gps=gps,
+                gps_carla_from_gnss=gps_carla,
                 speed=speed,
                 compass=compass,
-                target_point=target_point,
-                nav_command=nav_command
             )
             
             # --- Live Render Neural Network Predicted Path (Red) ---
@@ -1152,10 +1134,11 @@ Examples:
                 # Periodically Print Raw Waypoint Mathematics for the User
                 if fps_counter == 2:
                     carla_local_wps = []
-                    for i in range(min(5, len(current_route))):
-                        wp_loc = current_route[i][0].transform.location
-                        dx = wp_loc.x - transform.location.x
-                        dy = wp_loc.y - transform.location.y
+                    _rl = list(agent._route_planner.route)
+                    for i in range(min(5, len(_rl))):
+                        pos = _rl[i][0]
+                        dx = float(pos[0]) - transform.location.x
+                        dy = float(pos[1]) - transform.location.y
                         lfwd = dx * cos_y + dy * sin_y
                         lrgt = -dx * sin_y + dy * cos_y
                         carla_local_wps.append((lfwd, lrgt))
@@ -1212,14 +1195,22 @@ Examples:
                     _sem_str = "None"
                     
                 _cmd_names = {1:'LEFT', 2:'RIGHT', 3:'STRAIGHT', 4:'FOLLOW'}
-                _cmd_str = f"{nav_command}({_cmd_names.get(nav_command,'?')})"
+                _nc = agent.last_nav_command
+                _cmd_str = f"{_nc}({_cmd_names.get(_nc,'?')})"
                 
                 print(f"\n[{elapsed:.0f}s/{args.duration}s] Speed: {speed:.1f}m/s | "
                       f"Steer: {control.steer:+.2f} | Throttle: {control.throttle:.2f} | "
                       f"Brake: {control.brake:.2f} | FPS: {fps:.1f} | Rem: {remaining:.0f}s")
                 print(f"      YAW={_yaw_deg:+.1f}° | THETA={_theta_deg:+.1f}° | theta_check={_theta_ok}")
                 
-                _ego_target = t_u.inverse_conversion_2d(target_point, [gps[0], gps[1]], compass)
+                _rp = agent._route_planner.route
+                if len(_rp) > 2:
+                    _tp = np.asarray(_rp[1][0], dtype=np.float64)
+                elif len(_rp) > 0:
+                    _tp = np.asarray(_rp[0][0], dtype=np.float64)
+                else:
+                    _tp = agent.ukf.x[:2].copy()
+                _ego_target = t_u.inverse_conversion_2d(_tp, agent.ukf.x[:2], agent.ukf.x[2])
                 print(f"      target_ego=[{_ego_target[0]:+.1f}, {_ego_target[1]:+.1f}] "
                       f"({'AHEAD' if _ego_target[0] > 0 else 'BEHIND!!'})")
                 print(f"      sem_tags: {_sem_str}")
