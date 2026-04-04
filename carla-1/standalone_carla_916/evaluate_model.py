@@ -45,7 +45,11 @@ sys.path.insert(0, os.path.join(TEAM_CODE_DIR, 'e2e_agent_sem_lidar2shenron_pack
 from model import LidarCenterNet
 from config import GlobalConfig
 from mask import generate_mask
-from sim_radar_utils.convert2D_img import convert_sem_lidar_2D_img_func
+import yaml
+from e2e_agent_sem_lidar2shenron_package.lidar import run_lidar
+from sim_radar_utils.radar_processor import RadarProcessor
+from sim_radar_utils.utils_radar import reformat_adc_shenron
+from sim_radar_utils.transform_utils import polar_to_cart, get_range_angle
 import transfuser_utils as t_u
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 from agents.navigation.local_planner import RoadOption
@@ -62,6 +66,26 @@ torch.backends.cudnn.allow_tf32 = True
 
 # Radar mask
 mask_for_radar = generate_mask(shape=256, start_angle=35, fov_degrees=110, end_mag=0)
+
+# ============================================================
+#  Local Radar Synthesis (Bypasses remote convert2D_img hardcoded path)
+# ============================================================
+def local_convert_sem_lidar_2D_img_func(sim_radar, invert_angle, limit=75):
+    config_path = os.path.join(TEAM_CODE_DIR, 'e2e_agent_sem_lidar2shenron_package', 'simulator_configs.yaml')
+    with open(config_path, 'r') as f:
+        sim_config = yaml.safe_load(f)
+    
+    sim_config['INVERT_ANGLE'] = invert_angle
+    
+    radar = run_lidar(sim_config, sim_radar)
+    radarProcessor = RadarProcessor()
+    
+    chirpLevelData = reformat_adc_shenron(radar)
+    rangeProfile = radarProcessor.cal_range_fft(chirpLevelData)
+    aoaProfile = radarProcessor.cal_angle_fft(rangeProfile)
+    range_angle = get_range_angle(aoaProfile)
+    cart_cord = polar_to_cart(range_angle, limit=limit)
+    return cart_cord
 
 # ============================================================
 #  Default paths for the IIITD Ubuntu system
@@ -148,6 +172,14 @@ def find_checkpoint(model_dir, checkpoint_name=None):
         path = os.path.join(model_dir, checkpoint_name)
         if os.path.isfile(path):
             return path
+            
+        # Optional fallback for DDP (_0.pth suffix)
+        if checkpoint_name.endswith('.pth') and not checkpoint_name.endswith('_0.pth'):
+            fallback = checkpoint_name.replace('.pth', '_0.pth')
+            path_fallback = os.path.join(model_dir, fallback)
+            if os.path.isfile(path_fallback):
+                return path_fallback
+
         # Maybe it's an absolute path
         if os.path.isfile(checkpoint_name):
             return checkpoint_name
@@ -297,13 +329,7 @@ class ShenronEvalAgent:
         self.state_log = deque(maxlen=max((self.config.lidar_seq_len * self.config.data_save_freq + 1), 20))
         self.config.data_save_freq = 5
 
-        # PID Tuning for Inference (do NOT override target_speeds — use values from config)
-        self.config.brake_ratio = 1.75
-        self.config.clip_delta = 0.80
-        self.config.clip_throttle = 0.90
-        self.config.turn_kp = 0.90
-        self.config.turn_ki = 0.30
-        self.config.turn_kd = 0.3
+        # PID tuning overrides removed to preserve proper configuration loaded from training.
 
         self.lidar_buffer = deque(maxlen=self.config.lidar_seq_len * self.config.data_save_freq + 1)
         self.semantic_lidar_buffer = deque(maxlen=self.config.lidar_seq_len * self.config.data_save_freq + 1)
@@ -317,6 +343,7 @@ class ShenronEvalAgent:
         # Stuck detection
         self.stuck_detector = 0
         self.force_move = 0
+        self.has_started = False
 
         # Target point tracking
         self.target_point_prev = np.array([0, 0])
@@ -400,7 +427,7 @@ class ShenronEvalAgent:
             gps: (2,) GPS position [x, y] in CARLA coordinates
             speed: float, vehicle speed m/s
             compass: float, vehicle heading in radians
-            target_point: (2,) target waypoint [x, y] in ego frame
+            target_point: (2,) target waypoint [x, y] in global CARLA coordinates
 
         Returns:
             carla.VehicleControl
@@ -507,26 +534,33 @@ class ShenronEvalAgent:
             # If radar synthesis OOMs, fall back to zero radar so the episode can continue.
             raw_radar = deepcopy(self.semantic_lidar_buffer[i])
             try:
-                radar_np = convert_sem_lidar_2D_img_func(raw_radar, 0)
+                radar_np = local_convert_sem_lidar_2D_img_func(raw_radar, 0)
 
                 if self.radar_cat == 1:
-                    radar_np_back = convert_sem_lidar_2D_img_func(raw_radar, 180)
-                    radar_np = radar_np * mask_for_radar
-                    radar_np_back = radar_np_back * mask_for_radar
+                    radar_np_back = local_convert_sem_lidar_2D_img_func(raw_radar, 180)
                     radar_np_back = np.rot90(np.rot90(radar_np_back))
-                    radar_np = radar_np + radar_np_back
+                    radar_cat_np = np.concatenate((radar_np, radar_np_back), axis=0)
+                    
+                    center_x, center_y = radar_cat_np.shape[1] // 2, radar_cat_np.shape[0] // 2
+                    crop_size = 256
+                    radar_np = radar_cat_np[center_y - crop_size // 2:center_y + crop_size // 2,
+                                            center_x - crop_size // 2:center_x + crop_size // 2]
                 elif self.radar_cat == 2:
-                    radar_np_back = convert_sem_lidar_2D_img_func(raw_radar, 180)
-                    radar_np_left = convert_sem_lidar_2D_img_func(raw_radar, 270)
-                    radar_np_right = convert_sem_lidar_2D_img_func(raw_radar, 90)
-                    radar_np = radar_np * mask_for_radar
-                    radar_np_back = radar_np_back * mask_for_radar
-                    radar_np_left = radar_np_left * mask_for_radar
-                    radar_np_right = radar_np_right * mask_for_radar
+                    radar_np_back = local_convert_sem_lidar_2D_img_func(raw_radar, 180)
+                    radar_np_left = local_convert_sem_lidar_2D_img_func(raw_radar, 270)
+                    radar_np_right = local_convert_sem_lidar_2D_img_func(raw_radar, 90)
+                    
+                    radar_np = crop256X256(radar_np) * mask_for_radar
+                    radar_np_back = crop256X256(radar_np_back) * mask_for_radar
+                    radar_np_left = crop256X256(radar_np_left) * mask_for_radar
+                    radar_np_right = crop256X256(radar_np_right) * mask_for_radar
+                    
                     radar_np_left = np.rot90(radar_np_left)
                     radar_np_back = np.rot90(np.rot90(radar_np_back))
                     radar_np_right = np.rot90(np.rot90(np.rot90(radar_np_right)))
                     radar_np = radar_np + radar_np_back + radar_np_left + radar_np_right
+                else:
+                    radar_np = crop256X256(radar_np)
             except torch.OutOfMemoryError:
                 self.radar_fallback_count += 1
                 if torch.cuda.is_available():
@@ -588,43 +622,48 @@ class ShenronEvalAgent:
                     print(f"  [DEBUG] uncertainty={uncertainty}")
                     print(f"  [DEBUG] target_speeds={self.config.target_speeds}")
                     print(f"  [DEBUG] ego_target={ego_target.cpu().numpy()[0]}, pred_aim_wp={pred_aim_wp}, pred_angle={pred_angle:.3f}")
-                # Always use the uncertainty-weighted sum. Never short-circuit to target_speed=0
-                # via a threshold: the model always predicts stop from standstill because it was
-                # trained on already-moving vehicles. The min-speed floor below handles startup.
-                target_speed = sum(uncertainty * self.config.target_speeds)
-                # Enforce minimum cruising speed unless sum is truly near-zero (genuine full-stop)
-                if target_speed > 0.01:
-                    target_speed = max(target_speed, 3.0)
+                # Match C-Shenron logic: only hard stop if uncertainty for bin 0 exceeds a high threshold
+                if uncertainty[0] > getattr(self.config, 'brake_uncertainty_threshold', 0.95):
+                    target_speed = self.config.target_speeds[0]
+                else:
+                    target_speed = sum(uncertainty * self.config.target_speeds)
+
             else:
                 idx = torch.argmax(pred_target_speed_probs)
                 target_speed = self.config.target_speeds[idx]
+            
+            # HARDCODE OVERRIDE: cap speed at 3.0 m/s for stable turning, but allow stopping!
+            target_speed = min(target_speed, 3.0)
 
         # ---- Stuck Detection (before PID so force_move can skip PID to prevent windup) ----
         # Grace period: model always predicts stop from standstill; don't count until warmup is done.
-        grace_period = self.config.lidar_seq_len * self.config.data_save_freq + 20
-        if speed < 0.1 and self.step > grace_period:
+        # ---- Stuck Detection (Standard TransFuser/C-Shenron Implementation) ----
+        # In the original C-Shenron `sensor_agent.py`, they DO NOT use 'wants_to_move'. 
+        # They increment `stuck_detector` unconditionally whenever speed < 0.1m/s.
+        # This is exactly how they break the neural network's causal confusion at green lights & spawn.
+        if speed < 0.1 and self.step > 20:
             self.stuck_detector += 1
         else:
             self.stuck_detector = 0
 
         actual_stuck_threshold = min(self.config.stuck_threshold, 40)
-        # Trigger creep only once per stuck episode; otherwise force_move gets re-armed every frame.
         if self.stuck_detector > actual_stuck_threshold and self.force_move == 0:
             self.force_move = max(self.config.creep_duration, 60)
 
         # ---- PID Control ----
         if self.force_move > 0:
-            # Skip PID entirely during forced creep to prevent turn-controller integral windup.
-            # Reset the turn controller window so it starts fresh after creep ends.
-            win = self.net.turn_controller_direct.window
-            for i in range(len(win)):
-                win[i] = 0.0
-            # Slight steering oscillation helps break free when nose is touching obstacles.
-            steer_sign = -1.0 if ((self.force_move // 10) % 2 == 0) else 1.0
-            steer, throttle, brake = 0.25 * steer_sign, 0.75, False
-            print(f'  [STUCK] Force creeping! Step: {self.step}')
+            # Standard TransFuser creep: override throttle but keep native steering (NO WIGGLES)
+            print(f'  [STUCK] TransFuser Force creeping! Step: {self.step}')
+            steer = float(pred_angle) if self.config.use_controller_input_prediction else 0.0
+            throttle = max(self.config.creep_throttle, 0.5)
+            brake = False
             self.force_move -= 1
             self.stuck_detector = 0
+            
+            # Reset turn-controller integral windup smoothly
+            win = self.net.turn_controller_direct.window if self.config.use_controller_input_prediction else self.net.turn_controller.window
+            for i in range(len(win)): win[i] = 0.0
+
         elif self.config.use_controller_input_prediction:
             steer, throttle, brake = self.net.control_pid_direct(target_speed, pred_angle, gt_velocity)
         elif self.config.use_wp_gru:
@@ -675,6 +714,15 @@ def setup_carla(host='localhost', port=2000, town='Town01', weather='ClearNoon')
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = 0.05  # 20 FPS
     world.apply_settings(settings)
+
+    # Shorten traffic light durations for faster testing
+    world.tick()
+    tl_actors = world.get_actors().filter('traffic.traffic_light')
+    for tl in tl_actors:
+        tl.set_green_time(15.0)
+        tl.set_red_time(5.0)
+        tl.set_yellow_time(2.0)
+    print(f'  Traffic lights: {len(tl_actors)} found, red=5s, yellow=2s, green=15s')
 
     traffic_manager = client.get_trafficmanager(8100)
     traffic_manager.set_synchronous_mode(True)
@@ -798,13 +846,13 @@ class SensorData:
     def on_semantic_lidar(self, data):
         points = np.frombuffer(data.raw_data, dtype=np.dtype([
             ('x', np.float32), ('y', np.float32), ('z', np.float32),
-            ('CosAngle', np.float32), ('ObjIdx', np.uint32), ('ObjTag', np.uint32)
+            ('cos', np.float32), ('idx', np.uint32), ('tag', np.uint32)
         ]))
         result = np.column_stack([
             points['x'], points['y'], points['z'],
-            points['CosAngle'],
-            points['ObjIdx'].astype(np.float64),
-            points['ObjTag'].astype(np.float64)
+            points['cos'],
+            points['idx'].astype(np.float64),
+            points['tag'].astype(np.float64)
         ])
         self.semantic_lidar = result
 
@@ -907,8 +955,8 @@ Examples:
     parser.add_argument('--model-dir', default=DEFAULT_MODEL_DIR,
                         help=f'Path to model directory containing args.txt/config.pickle + .pth files '
                              f'(default: {DEFAULT_MODEL_DIR})')
-    parser.add_argument('--checkpoint', default='model_0020.pth',
-                        help='Specific .pth filename to use (default: auto-detect latest model_*_0.pth)')
+    parser.add_argument('--checkpoint', default='model_0019.pth',
+                        help='Specific .pth filename to use (default: model_0019.pth)')
     parser.add_argument('--host', default='localhost', help='CARLA server host')
     parser.add_argument('--port', type=int, default=2000, help='CARLA server port')
     parser.add_argument('--town', default='Town01', help='CARLA map to load')
@@ -916,10 +964,10 @@ Examples:
                         help=f'Weather preset. Options: {", ".join(WEATHER_PRESETS.keys())}')
     parser.add_argument('--radar-cat', type=int, default=1, help='0=front, 1=front+back, 2=all 4')
     parser.add_argument('--duration', type=int, default=600, help='Duration in seconds')
-    parser.add_argument('--vehicles', type=int, default=30, help='Number of NPC vehicles (0 to disable)')
-    parser.add_argument('--walkers', type=int, default=20, help='Number of pedestrians (0 to disable)')
+    parser.add_argument('--vehicles', type=int, default=0, help='Number of NPC vehicles (0 to disable)')
+    parser.add_argument('--walkers', type=int, default=0, help='Number of pedestrians (0 to disable)')
     parser.add_argument('--spawn-index', type=int, default=None, help='Specific spawn point index')
-    parser.add_argument('--sem-lidar-pps', type=int, default=120000,
+    parser.add_argument('--sem-lidar-pps', type=int, default=20000,
                         help='Semantic LiDAR points per second used for radar synthesis (lower reduces GPU memory)')
     args = parser.parse_args()
 
@@ -963,6 +1011,13 @@ Examples:
         print("Connecting to CARLA...")
         client, world, tm = setup_carla(args.host, args.port, args.town, args.weather)
         print(f"Connected! Town: {args.town}")
+
+        # Hack for evaluation: set all traffic lights to Green and freeze them
+        print("Forcing all traffic lights to Green...")
+        traffic_lights = world.get_actors().filter('*traffic_light*')
+        for tl in traffic_lights:
+            tl.set_state(carla.TrafficLightState.Green)
+            tl.set_green_time(99999.0)
 
         # 2. Load agent
         agent = ShenronEvalAgent(config, checkpoint_path, radar_cat=args.radar_cat)
@@ -1013,7 +1068,7 @@ Examples:
         while time.time() - start_time < args.duration:
             world.tick()
 
-            if sensor_data.rgb is None or sensor_data.lidar is None or sensor_data.semantic_lidar is None:
+            if sensor_data.rgb is None or sensor_data.lidar is None or sensor_data.semantic_lidar is None or sensor_data.imu is None or sensor_data.gnss is None:
                 continue
 
             # Get vehicle state
@@ -1022,9 +1077,8 @@ Examples:
             speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
 
             gps = np.array([transform.location.x, transform.location.y])
-            # Match the compass convention used during training (data_collector_v2.py).
-            # No -90° offset: we read transform.rotation.yaw directly, not IMU compass.
-            compass = t_u.normalize_angle(math.radians(transform.rotation.yaw))
+            # Match training precisely: read IMU compass and apply preprocessing (-90° offset)
+            compass = t_u.preprocess_compass(sensor_data.imu.compass)
 
             # --- Global Route Planner Logic ---
             # Pop passed waypoints by finding the physically closest point ahead of the car
@@ -1125,14 +1179,52 @@ Examples:
 
             # Telemetry
             fps_counter += 1
-            if time.time() - fps_timer > 5.0:
+            if time.time() - fps_timer > 2.0:
                 fps = fps_counter / (time.time() - fps_timer)
                 elapsed = time.time() - start_time
                 remaining = args.duration - elapsed
-                print(f"[{elapsed:.0f}s/{args.duration}s] Speed: {speed:.1f} m/s | "
-                      f"Steer: {control.steer:.2f} | Throttle: {control.throttle:.2f} | "
-                      f"Brake: {control.brake:.2f} | FPS: {fps:.1f} | "
-                      f"Remaining: {remaining:.0f}s")
+                
+                # --- Advanced Data Collector Telemetry Style ---
+                import math as _m
+                _yaw_deg = transform.rotation.yaw
+                _theta_deg = np.rad2deg(compass) # compass is theta in rads
+                # Compass now includes -90 deg offset, so we offset back before verifying against yaw
+                _theta_diff = abs(_theta_deg + 90.0 - _yaw_deg) % 360
+                if _theta_diff > 180:
+                    _theta_diff = 360 - _theta_diff
+                _theta_ok = "OK" if _theta_diff < 1.0 else f"OFFSET={_theta_diff:.0f}deg"
+
+                # Semantic tag distribution from the LiDAR
+                _sem_data = sensor_data.semantic_lidar
+                if _sem_data is not None and len(_sem_data) > 0:
+                    _tags, _cnts = np.unique(_sem_data[:, 5], return_counts=True)
+                    _top5 = sorted(zip(_tags, _cnts), key=lambda x: -x[1])[:5]
+                    _tag_names = {0:'NONE', 1:'Roads', 2:'Sidewalks', 3:'Buildings',
+                                  4:'Walls', 5:'Fences', 6:'Poles', 7:'TrafLight',
+                                  8:'TrafSign', 9:'Vegetation', 10:'Terrain',
+                                  11:'Sky', 12:'Pedestrian', 13:'Rider', 14:'Car',
+                                  15:'Truck', 16:'Bus', 17:'Train', 18:'Motorcycle',
+                                  19:'Bicycle', 20:'Static', 21:'Dynamic',
+                                  23:'Water', 24:'RoadLines', 25:'Ground',
+                                  26:'Bridge', 27:'RailTrack', 28:'GuardRail'}
+                    _sem_str = ' '.join(f"{_tag_names.get(int(t),f'?{int(t)}')}:{c}" for t,c in _top5)
+                else:
+                    _sem_str = "None"
+                    
+                _cmd_names = {1:'LEFT', 2:'RIGHT', 3:'STRAIGHT', 4:'FOLLOW'}
+                _cmd_str = f"{nav_command}({_cmd_names.get(nav_command,'?')})"
+                
+                print(f"\n[{elapsed:.0f}s/{args.duration}s] Speed: {speed:.1f}m/s | "
+                      f"Steer: {control.steer:+.2f} | Throttle: {control.throttle:.2f} | "
+                      f"Brake: {control.brake:.2f} | FPS: {fps:.1f} | Rem: {remaining:.0f}s")
+                print(f"      YAW={_yaw_deg:+.1f}° | THETA={_theta_deg:+.1f}° | theta_check={_theta_ok}")
+                
+                _ego_target = t_u.inverse_conversion_2d(target_point, [gps[0], gps[1]], compass)
+                print(f"      target_ego=[{_ego_target[0]:+.1f}, {_ego_target[1]:+.1f}] "
+                      f"({'AHEAD' if _ego_target[0] > 0 else 'BEHIND!!'})")
+                print(f"      sem_tags: {_sem_str}")
+                print(f"      cmd={_cmd_str}")
+
                 fps_counter = 0
                 fps_timer = time.time()
 

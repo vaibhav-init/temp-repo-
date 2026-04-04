@@ -58,7 +58,7 @@ def heatmap_gen(rho, theta, loss, speed, radar, plot_fig, return_power):
     # pdb.set_trace()
     device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
     # device = torch.device('cpu')
-    print(f"------- Using {device}:{gpu_id} -------") 
+    # print(f"------- Using {device}:{gpu_id} -------") 
 
     # beamforming_vector_constant = np.zeros((radar.nRx,rho.shape[0]))
     delta = torch.zeros((radar.nRx,rho.shape[0]),device= device)

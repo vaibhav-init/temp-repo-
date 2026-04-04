@@ -120,7 +120,7 @@ def Cropped_forRadar(pc, veh_coord, veh_angle, radarobj):
     simobj = Sceneset(new_pc)
 
     [rho, theta, loss, speed, angles] = simobj.specularpoints(radarobj)
-    print(f"Number of points = {rho.shape[0]}")
+    # print(f"Number of points = {rho.shape[0]}")
     return rho, theta, loss, speed, angles
 
 def run_lidar(sim_config, sem_lidar_frame):
