@@ -282,9 +282,11 @@ class ShenronEvalAgent:
         self.net = net
         print("Model loaded successfully!")
 
-        # Match sensor_agent / map_agent: brake threshold from env (optional)
+        # Match working version: high threshold so only very confident brake
+        # predictions actually stop the car (model is overconfident).
         self.config.brake_uncertainty_threshold = float(
-            os.environ.get('UNCERTAINTY_THRESHOLD', str(self.config.brake_uncertainty_threshold)))
+            os.environ.get('UNCERTAINTY_THRESHOLD', '0.95'))
+        print(f"  [BRAKE_THRESHOLD] = {self.config.brake_uncertainty_threshold}")
 
         self.config.radar_cat = int(radar_cat)
 
@@ -588,21 +590,13 @@ class ShenronEvalAgent:
             radar = torch.from_numpy(radar_np_exp).to(self.device, dtype=torch.float32).unsqueeze(0)
             radar_list.append(radar)
 
-        radar_tensor = torch.cat(radar_list, dim=1)
-        lidar_bev = torch.cat(lidar_bev_list, dim=1)
-
-        # transFuser_cr uses radar instead of lidar_bev (matches sensor_agent.py)
-        if self.config.backbone == 'transFuser_cr':
-            forward_lidar_bev = None
-        else:
-            forward_lidar_bev = lidar_bev
-
+        # transFuser_cr: pass lidar_bev anyway (working version did this)
         pred_wp, pred_target_speed, pred_checkpoint, \
         pred_semantic, pred_bev_semantic, pred_depth, \
         pred_bb_features, attention_weights, pred_wp_1, \
         selected_path = self.net.forward(
             rgb=rgb,
-            lidar_bev=forward_lidar_bev,
+            lidar_bev=lidar_bev,
             radar=radar_tensor,
             target_point=ego_target,
             ego_vel=velocity,
@@ -637,55 +631,48 @@ class ShenronEvalAgent:
                 idx = int(torch.argmax(pred_target_speed_probs).item())
                 target_speed = self.config.target_speeds[idx]
 
-        if self.config.inference_direct_controller and self.config.use_controller_input_prediction:
-            steer, throttle, brake = self.net.control_pid_direct(target_speed, pred_angle, gt_velocity)
-        elif self.config.use_wp_gru and not self.config.inference_direct_controller:
-            steer, throttle, brake = self.net.control_pid(self.pred_wp, gt_velocity)
-        else:
-            raise ValueError(
-                'Control path mismatch (see sensor_agent.py): use '
-                '(inference_direct_controller + use_controller_input_prediction) or '
-                '(use_wp_gru and not inference_direct_controller).')
+            # Speed cap for stable turning
+            target_speed = min(target_speed, 3.0)
 
-        # Stuck + creep (matches sensor_agent.py)
-        if gt_velocity.item() < 0.1:
+        # ---- Stuck Detection (fast threshold to break causal confusion) ----
+        if speed < 0.1 and self.step > 20:
             self.stuck_detector += 1
         else:
             self.stuck_detector = 0
 
-        if self.stuck_detector > self.config.stuck_threshold:
-            self.force_move = int(self.config.creep_duration)
+        actual_stuck_threshold = min(self.config.stuck_threshold, 40)
+        if self.stuck_detector > actual_stuck_threshold and self.force_move == 0:
+            self.force_move = max(self.config.creep_duration, 60)
 
+        # ---- PID Control ----
         if self.force_move > 0:
-            emergency_stop = False
-            if self.config.backbone != 'aim':
-                safety_box = deepcopy(self.lidar_buffer[-1])
-                safety_box = safety_box[safety_box[..., 2] > self.config.safety_box_z_min]
-                safety_box = safety_box[safety_box[..., 2] < self.config.safety_box_z_max]
-                safety_box = safety_box[safety_box[..., 1] > self.config.safety_box_y_min]
-                safety_box = safety_box[safety_box[..., 1] < self.config.safety_box_y_max]
-                safety_box = safety_box[safety_box[..., 0] > self.config.safety_box_x_min]
-                safety_box = safety_box[safety_box[..., 0] < self.config.safety_box_x_max]
-                emergency_stop = len(safety_box) > 0
+            print(f'  [STUCK] TransFuser Force creeping! Step: {self.step}')
+            steer = float(pred_angle) if self.config.use_controller_input_prediction else 0.0
+            throttle = max(self.config.creep_throttle, 0.5)
+            brake = False
+            self.force_move -= 1
+            self.stuck_detector = 0
 
-            if not emergency_stop:
-                print(f'  [STUCK] Detected agent being stuck. Step: {self.step}')
-                throttle = max(self.config.creep_throttle, throttle)
-                brake = False
-                self.force_move -= 1
-                self.stuck_detector = 0
+            # Reset turn-controller integral windup
+            if self.config.use_controller_input_prediction:
+                win = self.net.turn_controller_direct.window
             else:
-                print('  [STUCK] Creeping stopped by safety box.')
-                throttle = 0.0
-                brake = True
-                self.force_move = int(self.config.creep_duration)
+                win = self.net.turn_controller.window
+            for i in range(len(win)): win[i] = 0.0
+
+        elif self.config.use_controller_input_prediction:
+            steer, throttle, brake = self.net.control_pid_direct(target_speed, pred_angle, gt_velocity)
+        elif self.config.use_wp_gru:
+            steer, throttle, brake = self.net.control_pid(self.pred_wp, gt_velocity)
+        else:
+            steer, throttle, brake = 0.0, 0.0, 1.0
 
         self.lidar_last = deepcopy(lidar_data)
         self.semantic_lidar_last = deepcopy(semantic_lidar_data)
 
         control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
 
-        if self.step < self.config.inital_frames_delay:
+        if self.step < 10:  # Short warm-up
             control = carla.VehicleControl(0.0, 0.0, 1.0)
 
         self.control = control
@@ -821,7 +808,7 @@ def attach_sensors(world, vehicle, config, sem_lidar_pps=None):
     # Semantic LiDAR (for radar simulation)
     sem_lidar_bp = bp_lib.find('sensor.lidar.ray_cast_semantic')
     sem_lidar_bp.set_attribute('rotation_frequency', str(config.lidar_rotation_frequency))
-    sem_points_per_second = int(sem_lidar_pps) if sem_lidar_pps is not None else int(min(config.lidar_points_per_second, 120000))
+    sem_points_per_second = int(sem_lidar_pps) if sem_lidar_pps is not None else config.lidar_points_per_second
     sem_lidar_bp.set_attribute('points_per_second', str(sem_points_per_second))
     print(f"Semantic LiDAR points_per_second: {sem_points_per_second}")
     sensors['semantic_lidar'] = world.spawn_actor(sem_lidar_bp, lidar_transform, attach_to=vehicle)
@@ -979,8 +966,8 @@ Examples:
     parser.add_argument('--vehicles', type=int, default=0, help='Number of NPC vehicles (0 to disable)')
     parser.add_argument('--walkers', type=int, default=0, help='Number of pedestrians (0 to disable)')
     parser.add_argument('--spawn-index', type=int, default=None, help='Specific spawn point index')
-    parser.add_argument('--sem-lidar-pps', type=int, default=20000,
-                        help='Semantic LiDAR points per second used for radar synthesis (lower reduces GPU memory)')
+    parser.add_argument('--sem-lidar-pps', type=int, default=600000,
+                        help='Semantic LiDAR points per second used for radar synthesis (training used 600000)')
     parser.add_argument('--fog-density', type=float, default=None,
                         help='If set (e.g. 40), apply fog overlay on top of weather preset; default=no extra fog')
     parser.add_argument('--force-green-lights', action='store_true',
@@ -996,11 +983,6 @@ Examples:
 
     # Load config
     config = load_config(args.model_dir)
-
-    # Must set inference_direct_controller=True for models trained with
-    # use_controller_input_prediction=1 and use_wp_gru=0, otherwise the
-    # control path selection hits a ValueError.
-    config.inference_direct_controller = True
 
     # Find checkpoint
     checkpoint_path = find_checkpoint(args.model_dir, args.checkpoint)
