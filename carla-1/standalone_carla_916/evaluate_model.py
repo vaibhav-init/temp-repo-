@@ -616,15 +616,15 @@ class ShenronEvalAgent:
             # Matches C-Shenron autopilot.py _get_angle_to() and data_collector_v2.py
             pred_angle = -math.degrees(math.atan2(-pred_aim_wp[1], pred_aim_wp[0])) / 90.0
 
-            # Hardcode speed override based on user request: 4m/s on straight, 2m/s on turns
+            # Hardcode speed override based on user request: 5m/s on straight, 2m/s on turns
             # We detect turns either by the high-level nav command or by the predicted curve angle.
-            if self.last_nav_command in [1, 2] or abs(pred_angle) > 0.15:
+            if nav_command in [1, 2] or abs(pred_angle) > 0.15:
                 target_speed = 2.0
             else:
-                target_speed = 4.0
+                target_speed = 5.0
             
             if self.step % 20 == 0:
-                print(f"  [DEBUG] OVERRIDE target_speed={target_speed} (nav_command={self.last_nav_command}, pred_angle={pred_angle:.3f})")
+                print(f"  [DEBUG] OVERRIDE target_speed={target_speed} (nav_command={nav_command}, pred_angle={pred_angle:.3f})")
 
         # ---- Stuck Detection (before PID so force_move can skip PID to prevent windup) ----
         # Grace period: model always predicts stop from standstill; don't count until warmup is done.
