@@ -299,7 +299,7 @@ class ShenronEvalAgent:
                        z_mean_fn=self.z_mean, residual_x=self.residual_state_x, residual_z=self.residual_measurement)
         self.ukf.x = np.array([0, 0, 0, 0])
         self.ukf.P = np.diag([0.5, 0.5, 0.000001, 0.000001])
-        self.ukf.R = np.diag([0.5, 0.5, 0.000001, 0.000001])
+        self.ukf.R = np.diag([0.5, 0.5, 0.000000000000001, 0.000000000000001])
         self.ukf.Q = np.diag([0.0001, 0.0001, 0.001, 0.001])
         self.filter_initialized = False
 
@@ -526,10 +526,12 @@ class ShenronEvalAgent:
 
                 if self.config.radar_cat == 1:
                     radar_np_back = convert_sem_lidar_2D_img_func(raw_radar, 180)
-                    radar_np = radar_np * mask_for_radar
-                    radar_np_back = radar_np_back * mask_for_radar
                     radar_np_back = np.rot90(np.rot90(radar_np_back))
-                    radar_np = radar_np + radar_np_back
+                    radar_cat = np.concatenate((radar_np, radar_np_back), axis=0)  # (512, 256)
+                    center_x, center_y = radar_cat.shape[1] // 2, radar_cat.shape[0] // 2
+                    crop_size = 256
+                    radar_np = radar_cat[center_y - crop_size // 2:center_y + crop_size // 2,
+                                         center_x - crop_size // 2:center_x + crop_size // 2]
 
                 if self.config.radar_cat == 2:
                     radar_np_back = convert_sem_lidar_2D_img_func(raw_radar, 180)
@@ -582,12 +584,18 @@ class ShenronEvalAgent:
         radar_tensor = torch.cat(radar_list, dim=1)
         lidar_bev = torch.cat(lidar_bev_list, dim=1)
 
+        # transFuser_cr uses radar instead of lidar_bev (matches sensor_agent.py)
+        if self.config.backbone == 'transFuser_cr':
+            forward_lidar_bev = None
+        else:
+            forward_lidar_bev = lidar_bev
+
         pred_wp, pred_target_speed, pred_checkpoint, \
         pred_semantic, pred_bev_semantic, pred_depth, \
         pred_bb_features, attention_weights, pred_wp_1, \
         selected_path = self.net.forward(
             rgb=rgb,
-            lidar_bev=lidar_bev,
+            lidar_bev=forward_lidar_bev,
             radar=radar_tensor,
             target_point=ego_target,
             ego_vel=velocity,
@@ -981,6 +989,11 @@ Examples:
 
     # Load config
     config = load_config(args.model_dir)
+
+    # Must set inference_direct_controller=True for models trained with
+    # use_controller_input_prediction=1 and use_wp_gru=0, otherwise the
+    # control path selection hits a ValueError.
+    config.inference_direct_controller = True
 
     # Find checkpoint
     checkpoint_path = find_checkpoint(args.model_dir, args.checkpoint)

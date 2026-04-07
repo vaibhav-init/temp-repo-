@@ -9,7 +9,10 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from agents.navigation.global_route_planner import GlobalRoutePlanner
-from agents.navigation.global_route_planner_dao import GlobalRoutePlannerDAO
+try:
+  from agents.navigation.global_route_planner_dao import GlobalRoutePlannerDAO
+except ImportError:
+  GlobalRoutePlannerDAO = None  # Removed in CARLA 0.9.14+
 
 
 class PIDController(object):
@@ -150,9 +153,14 @@ def interpolate_trajectory(world_map, waypoints_trajectory, hop_resolution=1.0, 
         trajectory going to be made
     """
 
-  dao = GlobalRoutePlannerDAO(world_map, hop_resolution)
-  grp = GlobalRoutePlanner(dao)
-  grp.setup()
+  if GlobalRoutePlannerDAO is not None:
+    # Old CARLA API (< 0.9.14)
+    dao = GlobalRoutePlannerDAO(world_map, hop_resolution)
+    grp = GlobalRoutePlanner(dao)
+    grp.setup()
+  else:
+    # New CARLA API (0.9.14+)
+    grp = GlobalRoutePlanner(world_map, hop_resolution)
   # Obtain route plan
   route = []
   # Goes until the one before the last.
