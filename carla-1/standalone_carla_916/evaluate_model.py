@@ -288,6 +288,13 @@ class ShenronEvalAgent:
 
         self.config.radar_cat = int(radar_cat)
 
+        # Match sensor_agent.py SLOWER: reduce target speeds by 2 m/s to
+        # counteract classification overconfidence
+        if int(os.environ.get('SLOWER', 1)):
+            self.config.target_speeds[2] = self.config.target_speeds[2] - 2.0
+            self.config.target_speeds[3] = self.config.target_speeds[3] - 2.0
+            print(f"  [SLOWER] target_speeds adjusted to {self.config.target_speeds}")
+
         # C-Shenron nav_planner.RoutePlanner (set via attach_route_planner before driving)
         self._route_planner = None
         self.last_nav_command = 4
@@ -1099,9 +1106,10 @@ Examples:
             velocity = vehicle.get_velocity()
             speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
 
-            gnss = sensor_data.gnss
-            gps_carla = agent._route_planner.convert_gps_to_carla(
-                np.array([gnss.latitude, gnss.longitude], dtype=np.float64))
+            # Use world coordinates directly (not GNSS) since route waypoints
+            # are in raw CARLA world XY.  GNSS→convert_gps_to_carla produces a
+            # different reference frame, causing ~655 m offset in ego target.
+            gps_carla = np.array([transform.location.x, transform.location.y], dtype=np.float64)
             compass = t_u.preprocess_compass(sensor_data.imu.compass)
 
             if len(agent._route_planner.route) < 15:
