@@ -590,6 +590,9 @@ class ShenronEvalAgent:
             radar = torch.from_numpy(radar_np_exp).to(self.device, dtype=torch.float32).unsqueeze(0)
             radar_list.append(radar)
 
+        radar_tensor = torch.cat(radar_list, dim=1)
+        lidar_bev = torch.cat(lidar_bev_list, dim=1)
+
         # transFuser_cr: pass lidar_bev anyway (working version did this)
         pred_wp, pred_target_speed, pred_checkpoint, \
         pred_semantic, pred_bev_semantic, pred_depth, \
