@@ -623,6 +623,8 @@ class ShenronEvalAgent:
             else:
                 target_speed = 5.0
             
+            
+            
             if self.step % 20 == 0:
                 print(f"  [DEBUG] OVERRIDE target_speed={target_speed} (nav_command={nav_command}, pred_angle={pred_angle:.3f})")
 
