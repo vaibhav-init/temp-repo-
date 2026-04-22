@@ -47,6 +47,10 @@ import traceback
 CARLA_HOST = '127.0.0.1'
 CARLA_PORT = 2000
 DEFAULT_TOWN = 'Town01'
+
+# Map pool for rotation (changes every 5 scenarios)
+MAP_POOL = ['Town01', 'Town03']
+MAP_CHANGE_INTERVAL = 5  # Change map every N scenarios
 FPS = 20  # Simulation tick rate
 SAVE_DIR = 'dataset_crash'
 
@@ -58,156 +62,206 @@ LANE_HALF_WIDTH = 4.0        # meters — lateral search width
 LOOKAHEAD_SECONDS = 2.0
 LOOKAHEAD_FRAMES = int(LOOKAHEAD_SECONDS * FPS)  # 40 frames at 20 FPS
 
-# Stuck detection
-STUCK_TIMEOUT_SECONDS = 20   # End scenario if ego stuck this long
+# Stuck recovery
+STUCK_LANE_CHANGE_SECONDS = 6  # Try lane change every N seconds when stuck
+STUCK_DESTROY_BLOCKER_SECONDS = 30  # Destroy nearest NPC blocking ego after this long
+STUCK_SPEED_THRESHOLD = 0.5    # m/s — below this counts as stuck
 
-# Weather presets for diversity
+# Weather presets — heavier fog & rain for reduced visibility
 WEATHER_PRESETS = [
-    {'name': 'Clear Day',    'cloudiness': 10,  'precipitation': 0,  'fog_density': 0,   'wetness': 0,   'sun_altitude': 60},
-    {'name': 'Cloudy',       'cloudiness': 70,  'precipitation': 0,  'fog_density': 10,  'wetness': 0,   'sun_altitude': 45},
-    {'name': 'Light Rain',   'cloudiness': 60,  'precipitation': 30, 'fog_density': 10,  'wetness': 30,  'sun_altitude': 40},
-    {'name': 'Heavy Rain',   'cloudiness': 90,  'precipitation': 80, 'fog_density': 30,  'wetness': 80,  'sun_altitude': 20},
-    {'name': 'Dense Fog',    'cloudiness': 60,  'precipitation': 0,  'fog_density': 80,  'wetness': 20,  'sun_altitude': 45},
-    {'name': 'Fog + Rain',   'cloudiness': 80,  'precipitation': 50, 'fog_density': 60,  'wetness': 60,  'sun_altitude': 30},
-    {'name': 'Night Clear',  'cloudiness': 10,  'precipitation': 0,  'fog_density': 0,   'wetness': 0,   'sun_altitude': -30},
-    {'name': 'Night Rain',   'cloudiness': 90,  'precipitation': 70, 'fog_density': 40,  'wetness': 80,  'sun_altitude': -20},
-    {'name': 'Stormy',       'cloudiness': 100, 'precipitation': 100,'fog_density': 50,  'wetness': 100, 'sun_altitude': 10},
+    {'name': 'Clear Day',    'cloudiness': 10,  'precipitation': 0,   'fog_density': 0,   'wetness': 0,   'sun_altitude': 60},
+    {'name': 'Overcast',     'cloudiness': 80,  'precipitation': 0,   'fog_density': 25,  'wetness': 10,  'sun_altitude': 40},
+    {'name': 'Rainy',        'cloudiness': 80,  'precipitation': 60,  'fog_density': 30,  'wetness': 60,  'sun_altitude': 35},
+    {'name': 'Heavy Rain',   'cloudiness': 95,  'precipitation': 100, 'fog_density': 50,  'wetness': 100, 'sun_altitude': 15},
+    {'name': 'Dense Fog',    'cloudiness': 70,  'precipitation': 0,   'fog_density': 100, 'wetness': 30,  'sun_altitude': 40},
+    {'name': 'Fog + Rain',   'cloudiness': 90,  'precipitation': 70,  'fog_density': 80,  'wetness': 80,  'sun_altitude': 25},
+    {'name': 'Night Fog',    'cloudiness': 50,  'precipitation': 0,   'fog_density': 90,  'wetness': 20,  'sun_altitude': -30},
+    {'name': 'Night Storm',  'cloudiness': 100, 'precipitation': 100, 'fog_density': 70,  'wetness': 100, 'sun_altitude': -20},
+    {'name': 'Whiteout',     'cloudiness': 100, 'precipitation': 100, 'fog_density': 100, 'wetness': 100, 'sun_altitude': 10},
 ]
 
 # Ego driving profiles (TM tweaks) — varies across scenarios
+# ignore_vehicles: % chance ego ignores vehicles ahead
+#   Keep LOW (5-25%) so crashes are occasional and realistic, not every vehicle
+# weight: selection probability (higher = more likely to be chosen)
 DRIVING_PROFILES = [
-    {'name': 'Aggressive',    'speed_diff': -30, 'follow_dist': 2.0, 'ignore_lights': 15, 'lane_change': True},
-    {'name': 'Fast',          'speed_diff': -20, 'follow_dist': 3.0, 'ignore_lights': 10, 'lane_change': True},
-    {'name': 'Normal',        'speed_diff':   0, 'follow_dist': 5.0, 'ignore_lights': 5,  'lane_change': True},
-    {'name': 'Cautious',      'speed_diff':  10, 'follow_dist': 6.0, 'ignore_lights': 0,  'lane_change': False},
-    {'name': 'Reckless',      'speed_diff': -40, 'follow_dist': 1.5, 'ignore_lights': 25, 'lane_change': True},
-    {'name': 'Tailgater',     'speed_diff': -10, 'follow_dist': 1.0, 'ignore_lights': 5,  'lane_change': False},
+    {'name': 'Reckless',      'speed_diff': -60, 'follow_dist': 1.0, 'ignore_lights': 40, 'ignore_vehicles': 25, 'lane_change': True, 'weight': 30},
+    {'name': 'Aggressive',    'speed_diff': -50, 'follow_dist': 1.5, 'ignore_lights': 20, 'ignore_vehicles': 15, 'lane_change': True, 'weight': 25},
+    {'name': 'Tailgater',     'speed_diff': -20, 'follow_dist': 0.5, 'ignore_lights': 10, 'ignore_vehicles': 10, 'lane_change': True, 'weight': 20},
+    {'name': 'Fast',          'speed_diff': -30, 'follow_dist': 2.0, 'ignore_lights': 15, 'ignore_vehicles': 5,  'lane_change': True, 'weight': 15},
+    {'name': 'Normal',        'speed_diff':   0, 'follow_dist': 4.0, 'ignore_lights': 5,  'ignore_vehicles': 0,  'lane_change': True, 'weight': 7},
+    {'name': 'Cautious',      'speed_diff':  10, 'follow_dist': 6.0, 'ignore_lights': 0,  'ignore_vehicles': 0,  'lane_change': True, 'weight': 3},
 ]
+_PROFILE_WEIGHTS = [p['weight'] for p in DRIVING_PROFILES]
+_PROFILE_WEIGHT_SUM = sum(_PROFILE_WEIGHTS)
 
 
 # ============================================================================
-# Obstacle Detection
+# Radar Sensor Recorder
 # ============================================================================
-def find_nearest_obstacle(ego_vehicle, world):
+class RadarRecorder:
     """
-    Find the nearest obstacle (vehicle or pedestrian) in ego's forward cone.
+    Processes radar detections into obstacle features.
 
-    Scans all vehicles and pedestrians, projects them into ego's local frame,
-    and finds the closest one that is:
-      - Ahead of ego (forward_dist > 1.0m)
-      - Within lane width (|lateral_dist| < LANE_HALF_WIDTH)
+    CARLA radar returns a list of detections, each with:
+      - depth: distance in meters
+      - velocity: radial velocity (negative = approaching)
+      - azimuth: horizontal angle in radians
+      - altitude: vertical angle in radians
 
-    Returns dict with:
-      distance, relative_velocity, obstacle_speed, obstacle_type, lateral_offset
+    We extract the nearest detection in forward cone and compute:
+      distance, relative_velocity, obstacle_speed, lateral_offset
     """
-    ego_transform = ego_vehicle.get_transform()
-    ego_location = ego_transform.location
-    ego_forward = ego_transform.get_forward_vector()
-    ego_right = ego_transform.get_right_vector()
-    ego_velocity = ego_vehicle.get_velocity()
+    def __init__(self, vehicle, world, range_m=50.0, fov_h=30, fov_v=10, pps=1500):
+        self.latest_data = {
+            'distance': range_m,
+            'relative_velocity': 0.0,
+            'obstacle_speed': 0.0,
+            'obstacle_type': 2,  # 2=none, radar can't distinguish type
+            'lateral_offset': 0.0,
+            'num_detections': 0,
+        }
+        self._ego_speed = 0.0  # Updated each frame from main loop
 
-    # Default: no obstacle found
-    nearest = {
-        'distance': MAX_SEARCH_DISTANCE,
-        'relative_velocity': 0.0,
-        'obstacle_speed': 0.0,
-        'obstacle_type': 2,  # 2 = none/static
-        'lateral_offset': 0.0,
-    }
+        # Spawn radar sensor
+        bp = world.get_blueprint_library().find('sensor.other.radar')
+        bp.set_attribute('horizontal_fov', str(fov_h))
+        bp.set_attribute('vertical_fov', str(fov_v))
+        bp.set_attribute('range', str(range_m))
+        bp.set_attribute('points_per_second', str(pps))
 
-    # Gather all potential obstacles
-    vehicles = world.get_actors().filter('*vehicle*')
-    pedestrians = world.get_actors().filter('*walker.pedestrian*')
+        # Mount radar on front bumper
+        radar_tf = carla.Transform(
+            carla.Location(x=2.5, z=0.7),  # front of car, bumper height
+            carla.Rotation(pitch=0)
+        )
+        self.sensor = world.spawn_actor(bp, radar_tf, attach_to=vehicle)
+        self.sensor.listen(self._on_radar)
+        self._range = range_m
+        print(f"  ✅ Radar sensor (range={range_m}m, fov={fov_h}°, {pps} pts/s)")
 
-    all_obstacles = []
-    for v in vehicles:
-        if v.id != ego_vehicle.id:
-            all_obstacles.append((v, 0))  # 0 = vehicle
-    for p in pedestrians:
-        all_obstacles.append((p, 1))  # 1 = pedestrian
+    def update_ego_speed(self, speed):
+        """Call each frame so we can compute obstacle_speed."""
+        self._ego_speed = speed
 
-    for obstacle, obs_type in all_obstacles:
-        obs_location = obstacle.get_location()
+    def _on_radar(self, radar_data):
+        """Process radar detections, find nearest obstacle in forward cone."""
+        detections = radar_data  # iterable of carla.RadarDetection
 
-        # Quick world-distance filter
-        world_dist = ego_location.distance(obs_location)
-        if world_dist > MAX_SEARCH_DISTANCE:
-            continue
+        nearest_dist = self._range
+        nearest_vel = 0.0
+        nearest_azimuth = 0.0
+        count = 0
 
-        # Vector from ego to obstacle
-        dx = obs_location.x - ego_location.x
-        dy = obs_location.y - ego_location.y
+        for det in detections:
+            count += 1
+            # det.depth = distance, det.velocity = radial velocity
+            # det.azimuth = horizontal angle (rad), det.altitude = vertical angle (rad)
 
-        # Project onto ego's local frame
-        forward_dist = dx * ego_forward.x + dy * ego_forward.y
-        lateral_dist = dx * ego_right.x + dy * ego_right.y
-
-        # Must be ahead and within lane
-        if forward_dist < 1.0:
-            continue
-        if abs(lateral_dist) > LANE_HALF_WIDTH:
-            continue
-
-        if forward_dist < nearest['distance']:
-            # Compute relative velocity along line of sight
-            obs_velocity = obstacle.get_velocity()
-            obs_speed = math.sqrt(obs_velocity.x**2 + obs_velocity.y**2 + obs_velocity.z**2)
-
-            # Line of sight direction (normalized)
-            los_len = math.sqrt(dx**2 + dy**2)
-            if los_len < 0.1:
+            # Filter: only consider detections within narrow forward cone
+            if abs(det.azimuth) > 0.3:  # ~17 degrees each side
                 continue
-            los_x = dx / los_len
-            los_y = dy / los_len
+            if det.depth < 1.0:  # too close, likely self-detection
+                continue
 
-            # Project velocities along LOS
-            ego_approach = ego_velocity.x * los_x + ego_velocity.y * los_y
-            obs_approach = obs_velocity.x * los_x + obs_velocity.y * los_y
+            if det.depth < nearest_dist:
+                nearest_dist = det.depth
+                nearest_vel = det.velocity  # negative = approaching
+                nearest_azimuth = det.azimuth
 
-            # positive relative_velocity = closing in
-            relative_vel = ego_approach - obs_approach
+        # Convert to our feature format
+        # CARLA radar velocity: negative = approaching ego
+        relative_velocity = -nearest_vel  # flip sign: positive = closing in
 
-            nearest = {
-                'distance': forward_dist,
-                'relative_velocity': relative_vel,
-                'obstacle_speed': obs_speed,
-                'obstacle_type': obs_type,
-                'lateral_offset': lateral_dist,
-            }
+        # Approximate obstacle speed from relative velocity + ego speed
+        obstacle_speed = max(0, self._ego_speed - relative_velocity)
 
-    return nearest
+        # Lateral offset from azimuth: lateral = distance * sin(azimuth)
+        lateral_offset = nearest_dist * math.sin(nearest_azimuth) if nearest_dist < self._range else 0.0
+
+        self.latest_data = {
+            'distance': nearest_dist,
+            'relative_velocity': relative_velocity,
+            'obstacle_speed': obstacle_speed,
+            'obstacle_type': 0 if nearest_dist < self._range else 2,  # 0=detected, 2=none
+            'lateral_offset': lateral_offset,
+            'num_detections': count,
+        }
+
+    def get_nearest(self):
+        """Return latest processed radar data (same format as old find_nearest_obstacle)."""
+        return self.latest_data.copy()
+
+    def cleanup(self):
+        if self.sensor and self.sensor.is_alive:
+            self.sensor.destroy()
 
 
 # ============================================================================
 # Collision Recorder
 # ============================================================================
 class CollisionRecorder:
-    """Records collision events with frame indexing for retroactive labeling."""
+    """
+    Records collision events with frame indexing for retroactive labeling.
+
+    Deduplication: ignores repeat collisions with the same actor within
+    a 2-second cooldown window to prevent spam (CARLA fires collision
+    events every frame while two actors remain in contact).
+    """
+    COOLDOWN_SECONDS = 5.0     # Min interval between collisions with same actor
+    MIN_IMPULSE = 300.0        # Minimum impulse (N·s) to count as real crash
 
     def __init__(self, vehicle, world):
-        self.collision_frame_indices = []
-        self.collision_details = []
-        self.frame_counter = [0]  # Mutable ref updated by main loop
+        self.collision_frame_indices = []  # Deduplicated frame indices
+        self.collision_details = []        # Deduplicated details
+        self.frame_counter = [0]           # Mutable ref updated by main loop
+        self._last_collision_time = {}     # actor_id -> last collision timestamp
+        self._raw_collision_count = 0      # Total raw (unfiltered) events
+        self._skipped_low_impulse = 0      # Skipped due to low impulse
 
         bp = world.get_blueprint_library().find('sensor.other.collision')
         self.sensor = world.spawn_actor(bp, carla.Transform(), attach_to=vehicle)
         self.sensor.listen(self._on_collision)
-        print("  ✅ Collision sensor attached")
+        print(f"  ✅ Collision sensor (cooldown={self.COOLDOWN_SECONDS}s, min_impulse={self.MIN_IMPULSE}N·s)")
 
     def _on_collision(self, event):
+        self._raw_collision_count += 1
+        now = time.time()
+        actor_id = event.other_actor.id
+        actor_type = event.other_actor.type_id
+        impulse = event.normal_impulse.length()
+
+        # FILTER 1: Only vehicles and pedestrians (skip fences, signs, walls)
+        if not (actor_type.startswith('vehicle.') or actor_type.startswith('walker.')):
+            return
+
+        # FILTER 2: Minimum impulse — skip gentle bumps from stopped cars touching
+        if impulse < self.MIN_IMPULSE:
+            self._skipped_low_impulse += 1
+            return
+
+        # FILTER 3: Cooldown — skip if same actor within 5s
+        if actor_id in self._last_collision_time:
+            elapsed = now - self._last_collision_time[actor_id]
+            if elapsed < self.COOLDOWN_SECONDS:
+                return
+
+        self._last_collision_time[actor_id] = now
         frame_idx = self.frame_counter[0]
         self.collision_frame_indices.append(frame_idx)
 
         detail = {
             'frame_idx': frame_idx,
-            'other_actor': event.other_actor.type_id,
-            'impulse': event.normal_impulse.length(),
+            'other_actor': actor_type,
+            'impulse': impulse,
         }
         self.collision_details.append(detail)
 
         print(f"\n  💥 COLLISION at frame {frame_idx}!")
-        print(f"     Hit: {event.other_actor.type_id}")
-        print(f"     Impulse: {event.normal_impulse.length():.1f} N·s")
+        print(f"     Hit: {actor_type}")
+        print(f"     Impulse: {impulse:.1f} N·s")
+        print(f"     (raw: {self._raw_collision_count}, real: {len(self.collision_frame_indices)}, "
+              f"skipped_weak: {self._skipped_low_impulse})")
 
     def cleanup(self):
         if self.sensor and self.sensor.is_alive:
@@ -336,7 +390,7 @@ def spawn_challenging_scenario(world, ego_vehicle):
       - tight_traffic: Dense traffic cluster around ego
     """
     scenario_type = random.choice([
-        'sudden_brake', 'stopped_vehicle', 'jaywalker', 'tight_traffic'
+        'sudden_brake', 'jaywalker', 'tight_traffic', 'none'
     ])
 
     bp_lib = world.get_blueprint_library()
@@ -378,26 +432,8 @@ def spawn_challenging_scenario(world, ego_vehicle):
             })
             print(f"     Lead vehicle at ~{ahead_distance:.0f}m (will brake suddenly)")
 
-    elif scenario_type == 'stopped_vehicle':
-        ahead_distance = random.uniform(15, 30)
-        wp = ego_wp
-        for _ in range(int(ahead_distance / 3)):
-            next_wps = wp.next(3.0)
-            if not next_wps:
-                break
-            wp = next_wps[0]
-
-        vehicle_bp = random.choice([bp for bp in bp_lib.filter('vehicle.*')
-                                     if int(bp.get_attribute('number_of_wheels')) >= 4])
-        spawn_tf = wp.transform
-        spawn_tf.location.z += 0.5
-
-        stopped = world.try_spawn_actor(vehicle_bp, spawn_tf)
-        if stopped:
-            stopped.set_target_velocity(carla.Vector3D(0, 0, 0))
-            stopped.apply_control(carla.VehicleControl(brake=1.0))
-            spawned_actors.append({'actor': stopped, 'type': 'stopped'})
-            print(f"     Stopped vehicle at ~{ahead_distance:.0f}m")
+    elif scenario_type == 'none':
+        print(f"     Normal driving (no special scenario)")
 
     elif scenario_type == 'jaywalker':
         ahead_distance = random.uniform(10, 20)
@@ -506,10 +542,10 @@ def write_scenario_to_csv(csv_path, scenario_data, write_header=False):
 def main():
     parser = argparse.ArgumentParser(description='Crash probability data collector for CARLA 0.9.16')
     parser.add_argument('--town', default=DEFAULT_TOWN, help='CARLA town to use')
-    parser.add_argument('--scenarios', type=int, default=50, help='Number of scenarios to run')
+    parser.add_argument('--scenarios', type=int, default=60, help='Number of scenarios (60 ≈ 2 hours)')
     parser.add_argument('--duration', type=int, default=120, help='Duration per scenario in seconds')
-    parser.add_argument('--npc-vehicles', type=int, default=40, help='Number of NPC vehicles')
-    parser.add_argument('--npc-pedestrians', type=int, default=30, help='Number of pedestrians')
+    parser.add_argument('--npc-vehicles', type=int, default=60, help='Number of NPC vehicles (dense)')
+    parser.add_argument('--npc-pedestrians', type=int, default=50, help='Number of pedestrians (dense)')
     parser.add_argument('--host', default=CARLA_HOST)
     parser.add_argument('--port', type=int, default=CARLA_PORT)
     args = parser.parse_args()
@@ -537,17 +573,18 @@ def main():
     # Connect to CARLA
     print(f"\n🔌 Connecting to CARLA at {args.host}:{args.port}...")
     client = carla.Client(args.host, args.port)
-    client.set_timeout(20.0)
+    client.set_timeout(30.0)
 
-    # Load world
+    # Load initial map
     world = client.get_world()
-    current_map = world.get_map().name
-    if args.town not in current_map:
-        print(f"  Current map: {current_map}")
-        print(f"  Loading {args.town}...")
-        world = client.load_world(args.town)
+    current_map_name = world.get_map().name.split('/')[-1]  # e.g. 'Town01'
+    initial_town = random.choice(MAP_POOL)
+    if initial_town not in current_map_name:
+        print(f"  Loading {initial_town}...")
+        world = client.load_world(initial_town)
+        current_map_name = initial_town
     else:
-        print(f"  Already on {current_map}")
+        print(f"  Already on {current_map_name}")
 
     # Synchronous mode
     original_settings = world.get_settings()
@@ -569,6 +606,7 @@ def main():
 
     ego_vehicle = None
     collision_recorder = None
+    radar_recorder = None
     npc_vehicle_ids = []
     walker_ids = []
     ctrl_ids = []
@@ -581,10 +619,34 @@ def main():
             print(f"{'=' * 70}")
 
             # ----------------------------------------------------------
+            # Map rotation: change map every 5 scenarios
+            # ----------------------------------------------------------
+            if scenario_idx > 0 and scenario_idx % MAP_CHANGE_INTERVAL == 0:
+                new_town = random.choice(MAP_POOL)
+                if new_town not in current_map_name:
+                    print(f"\n  🗺️  Switching map: {current_map_name} → {new_town}")
+                    # Restore async mode before loading
+                    settings = world.get_settings()
+                    settings.synchronous_mode = False
+                    world.apply_settings(settings)
+                    world = client.load_world(new_town)
+                    current_map_name = new_town
+                    # Re-apply sync mode
+                    settings = world.get_settings()
+                    settings.synchronous_mode = True
+                    settings.fixed_delta_seconds = 1.0 / FPS
+                    world.apply_settings(settings)
+                    traffic_manager = client.get_trafficmanager(8000)
+                    traffic_manager.set_synchronous_mode(True)
+                    print(f"  ✅ Loaded {new_town}")
+
+            print(f"  🗺️  Map: {current_map_name}")
+
+            # ----------------------------------------------------------
             # Choose random weather and driving profile
             # ----------------------------------------------------------
             weather_preset = random.choice(WEATHER_PRESETS)
-            driving_profile = random.choice(DRIVING_PROFILES)
+            driving_profile = random.choices(DRIVING_PROFILES, weights=_PROFILE_WEIGHTS, k=1)[0]
 
             weather = carla.WeatherParameters(
                 cloudiness=weather_preset['cloudiness'],
@@ -631,24 +693,34 @@ def main():
             traffic_manager.auto_lane_change(
                 ego_vehicle, driving_profile['lane_change'])
 
-            # Try to set ignore lights/signs (may not exist in all CARLA versions)
+            # Try to set ignore lights/signs/vehicles (may not exist in all CARLA versions)
             try:
                 traffic_manager.ignore_lights_percentage(
                     ego_vehicle, driving_profile['ignore_lights'])
             except AttributeError:
-                print("     ⚠️  ignore_lights_percentage not available in this CARLA version")
+                print("     ⚠️  ignore_lights_percentage not available")
             try:
                 traffic_manager.ignore_signs_percentage(
                     ego_vehicle, driving_profile.get('ignore_signs', 10))
             except AttributeError:
                 pass
+            # KEY: ignore_vehicles makes ego push through traffic → causes crashes!
+            try:
+                traffic_manager.ignore_vehicles_percentage(
+                    ego_vehicle, driving_profile.get('ignore_vehicles', 0))
+                print(f"     ignore_vehicles={driving_profile.get('ignore_vehicles', 0)}%")
+            except AttributeError:
+                print("     ⚠️  ignore_vehicles_percentage not available")
 
             print(f"  ✅ TM autopilot configured with '{driving_profile['name']}' profile")
 
             # ----------------------------------------------------------
-            # Collision Recorder
+            # Sensors: Collision + Radar
             # ----------------------------------------------------------
             collision_recorder = CollisionRecorder(ego_vehicle, world)
+            radar_recorder = RadarRecorder(ego_vehicle, world,
+                                           range_m=MAX_SEARCH_DISTANCE,
+                                           fov_h=30, fov_v=10, pps=1500)
 
             # Let vehicle settle
             for _ in range(20):
@@ -698,35 +770,63 @@ def main():
                     break
 
                 # Get ego state
-                ego_velocity = ego_vehicle.get_velocity()
-                ego_speed = math.sqrt(
-                    ego_velocity.x**2 + ego_velocity.y**2 + ego_velocity.z**2)
-                ego_acceleration = (ego_speed - prev_speed) * FPS  # delta_v / delta_t
-                prev_speed = ego_speed
+                try:
+                    ego_velocity = ego_vehicle.get_velocity()
+                    ego_speed = math.sqrt(
+                        ego_velocity.x**2 + ego_velocity.y**2 + ego_velocity.z**2)
+                    ego_acceleration = (ego_speed - prev_speed) * FPS  # delta_v / delta_t
+                    prev_speed = ego_speed
 
-                ego_control = ego_vehicle.get_control()
-                ego_location = ego_vehicle.get_location()
+                    ego_control = ego_vehicle.get_control()
+                    ego_location = ego_vehicle.get_location()
+                except RuntimeError:
+                    print(f"  ⚠️  Ego vehicle destroyed, ending scenario")
+                    break
 
-                # Stuck detection
-                if ego_speed < 0.1:
+                # --- Stuck recovery ---
+                if ego_speed < STUCK_SPEED_THRESHOLD:
                     stuck_counter += 1
-                    if stuck_counter > FPS * STUCK_TIMEOUT_SECONDS:
-                        print(f"\n  ⚠️  Ego stuck for {STUCK_TIMEOUT_SECONDS}s, ending scenario early")
-                        break
+
+                    # Every 6s stuck, try forcing a lane change (alternate direction)
+                    if stuck_counter > 0 and stuck_counter % (FPS * STUCK_LANE_CHANGE_SECONDS) == 0:
+                        attempt = stuck_counter // (FPS * STUCK_LANE_CHANGE_SECONDS)
+                        direction = (attempt % 2 == 0)  # alternate left/right
+                        print(f"\n  ⚠️  Ego stuck ({stuck_counter // FPS}s) → forcing lane change ({'right' if direction else 'left'})")
+                        try:
+                            traffic_manager.force_lane_change(ego_vehicle, direction)
+                        except Exception:
+                            pass
+
+                    # After 30s stuck, destroy the nearest NPC blocking ego
+                    if stuck_counter == FPS * STUCK_DESTROY_BLOCKER_SECONDS:
+                        print(f"  ⚠️  Stuck for {STUCK_DESTROY_BLOCKER_SECONDS}s → removing blocking vehicle")
+                        # Find and destroy nearest vehicle that's blocking
+                        actors = world.get_actors().filter('vehicle.*')
+                        min_dist = 999
+                        blocker = None
+                        for a in actors:
+                            if a.id == ego_vehicle.id:
+                                continue
+                            d = ego_location.distance(a.get_location())
+                            if d < min_dist:
+                                min_dist = d
+                                blocker = a
+                        if blocker and min_dist < 10:
+                            print(f"     Destroying {blocker.type_id} at {min_dist:.1f}m")
+                            blocker.destroy()
+                            stuck_counter = 0  # Reset
+                        else:
+                            print(f"     No blocker found within 10m")
                 else:
                     stuck_counter = 0
 
-                # Teleport detection
-                if last_location is not None:
-                    jump = ego_location.distance(last_location)
-                    if jump > 50.0:
-                        print(f"\n  ⚠️  Ego teleported ({jump:.0f}m), ending scenario early")
-                        break
+                # Update last_location (for spectator, no teleport-break logic)
                 last_location = carla.Location(
                     x=ego_location.x, y=ego_location.y, z=ego_location.z)
 
-                # Find nearest obstacle
-                nearest = find_nearest_obstacle(ego_vehicle, world)
+                # Find nearest obstacle via RADAR sensor
+                radar_recorder.update_ego_speed(ego_speed)
+                nearest = radar_recorder.get_nearest()
 
                 # Compute TTC
                 if nearest['relative_velocity'] > 0.1:
@@ -827,8 +927,8 @@ def main():
                 print(f"       rel_velocity:  {min(rels):+6.1f} - {max(rels):+6.1f} m/s  (avg: {np.mean(rels):+.1f})")
                 print(f"       ttc:           {min(ttcs):6.1f} - {max(ttcs):6.1f} s    (avg: {np.mean(ttcs):.1f})")
 
-            # Write to CSV
-            write_header = (scenario_idx == 0) or not os.path.exists(csv_path)
+            # Write to CSV (append if file already exists)
+            write_header = not os.path.exists(csv_path)
             write_scenario_to_csv(csv_path, scenario_data, write_header=write_header)
 
             # Update global stats
@@ -848,6 +948,7 @@ def main():
             # ----------------------------------------------------------
             print(f"\n  🧹 Cleaning up scenario {scenario_idx + 1}...")
             collision_recorder.cleanup()
+            radar_recorder.cleanup()
             cleanup_scenario_actors(scenario_actors)
             cleanup_traffic(world, client, npc_vehicle_ids, walker_ids, ctrl_ids)
             npc_vehicle_ids = []
@@ -881,6 +982,12 @@ def main():
         if collision_recorder:
             try:
                 collision_recorder.cleanup()
+            except Exception:
+                pass
+
+        if radar_recorder:
+            try:
+                radar_recorder.cleanup()
             except Exception:
                 pass
 
