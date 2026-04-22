@@ -5,9 +5,9 @@ Crash Probability Data Collector for CARLA 0.9.16
 
 Collects kinematic features and collision labels for MLP training.
 
-Ego vehicle uses CARLA Traffic Manager autopilot with aggressive settings
-to create realistic (imperfect) driving behavior that naturally produces
-collisions in challenging scenarios.
+Ego vehicle uses CARLA Traffic Manager autopilot. Crashes happen
+NATURALLY from dense, chaotic traffic with aggressive NPC behavior —
+no scripted sudden-brake scenarios.
 
 Features collected per frame:
   - ego_speed           (m/s)
@@ -25,8 +25,8 @@ Label (applied retroactively):
 
 Usage:
     python data_collector_crash.py
-    python data_collector_crash.py --scenarios 30 --duration 90
-    python data_collector_crash.py --scenarios 100 --duration 120 --town Town03
+    python data_collector_crash.py --scenarios 80 --duration 60
+    python data_collector_crash.py --scenarios 100 --duration 60 --town Town03
 
 Press Ctrl+C to stop collection early.
 """
@@ -48,9 +48,9 @@ CARLA_HOST = '127.0.0.1'
 CARLA_PORT = 2000
 DEFAULT_TOWN = 'Town01'
 
-# Map pool for rotation (changes every 5 scenarios)
-MAP_POOL = ['Town01', 'Town03']
-MAP_CHANGE_INTERVAL = 5  # Change map every N scenarios
+# Map — Town01 only (good intersection layout with traffic lights)
+MAP_POOL = ['Town01']
+MAP_CHANGE_INTERVAL = 999  # Never change map
 FPS = 20  # Simulation tick rate
 SAVE_DIR = 'dataset_crash'
 
@@ -63,14 +63,11 @@ LOOKAHEAD_SECONDS = 2.0
 LOOKAHEAD_FRAMES = int(LOOKAHEAD_SECONDS * FPS)  # 40 frames at 20 FPS
 
 # Stuck recovery
-STUCK_LANE_CHANGE_SECONDS = 6  # Try lane change every N seconds when stuck
-STUCK_DESTROY_BLOCKER_SECONDS = 30  # Destroy nearest NPC blocking ego after this long
 STUCK_SPEED_THRESHOLD = 0.5    # m/s — below this counts as stuck
+STUCK_TELEPORT_SECONDS = 60    # After 60s stuck, teleport ego to new location
 
-# Weather presets — heavier fog & rain for reduced visibility
+# Weather presets
 WEATHER_PRESETS = [
-    {'name': 'Clear Day',    'cloudiness': 10,  'precipitation': 0,   'fog_density': 0,   'wetness': 0,   'sun_altitude': 60},
-    {'name': 'Overcast',     'cloudiness': 80,  'precipitation': 0,   'fog_density': 25,  'wetness': 10,  'sun_altitude': 40},
     {'name': 'Rainy',        'cloudiness': 80,  'precipitation': 60,  'fog_density': 30,  'wetness': 60,  'sun_altitude': 35},
     {'name': 'Heavy Rain',   'cloudiness': 95,  'precipitation': 100, 'fog_density': 50,  'wetness': 100, 'sun_altitude': 15},
     {'name': 'Dense Fog',    'cloudiness': 70,  'precipitation': 0,   'fog_density': 100, 'wetness': 30,  'sun_altitude': 40},
@@ -80,20 +77,33 @@ WEATHER_PRESETS = [
     {'name': 'Whiteout',     'cloudiness': 100, 'precipitation': 100, 'fog_density': 100, 'wetness': 100, 'sun_altitude': 10},
 ]
 
-# Ego driving profiles (TM tweaks) — varies across scenarios
-# ignore_vehicles: % chance ego ignores vehicles ahead
-#   Keep LOW (5-25%) so crashes are occasional and realistic, not every vehicle
-# weight: selection probability (higher = more likely to be chosen)
+# ── Ego driving profiles ────────────────────────────────────────────────
+# CRASH STRATEGY:
+# - High ignore_lights (50-80%) → ego frequently runs red lights
+#   → gets T-boned by cross-traffic at intersections
+# - Moderate ignore_vehicles (8-15%) → ego occasionally misjudges
+#   and rear-ends slower vehicles (but not constantly)
+# - Fast speeds with tight follow distances amplify crash likelihood
+# - NPCs drive NORMALLY so crashes look natural
 DRIVING_PROFILES = [
-    {'name': 'Reckless',      'speed_diff': -60, 'follow_dist': 1.0, 'ignore_lights': 40, 'ignore_vehicles': 25, 'lane_change': True, 'weight': 30},
-    {'name': 'Aggressive',    'speed_diff': -50, 'follow_dist': 1.5, 'ignore_lights': 20, 'ignore_vehicles': 15, 'lane_change': True, 'weight': 25},
-    {'name': 'Tailgater',     'speed_diff': -20, 'follow_dist': 0.5, 'ignore_lights': 10, 'ignore_vehicles': 10, 'lane_change': True, 'weight': 20},
-    {'name': 'Fast',          'speed_diff': -30, 'follow_dist': 2.0, 'ignore_lights': 15, 'ignore_vehicles': 5,  'lane_change': True, 'weight': 15},
-    {'name': 'Normal',        'speed_diff':   0, 'follow_dist': 4.0, 'ignore_lights': 5,  'ignore_vehicles': 0,  'lane_change': True, 'weight': 7},
-    {'name': 'Cautious',      'speed_diff':  10, 'follow_dist': 6.0, 'ignore_lights': 0,  'ignore_vehicles': 0,  'lane_change': True, 'weight': 3},
+    {'name': 'Reckless',      'speed_diff': -40, 'follow_dist': 1.5, 'ignore_lights': 80, 'ignore_vehicles': 15, 'lane_change': True, 'weight': 25},
+    {'name': 'Aggressive',    'speed_diff': -30, 'follow_dist': 2.0, 'ignore_lights': 60, 'ignore_vehicles': 12, 'lane_change': True, 'weight': 30},
+    {'name': 'Fast',          'speed_diff': -20, 'follow_dist': 2.5, 'ignore_lights': 50, 'ignore_vehicles': 8,  'lane_change': True, 'weight': 25},
+    {'name': 'Normal',        'speed_diff':   0, 'follow_dist': 3.0, 'ignore_lights': 30, 'ignore_vehicles': 5,  'lane_change': True, 'weight': 15},
+    {'name': 'Cautious',      'speed_diff':  10, 'follow_dist': 5.0, 'ignore_lights': 10, 'ignore_vehicles': 0,  'lane_change': True, 'weight': 5},
 ]
 _PROFILE_WEIGHTS = [p['weight'] for p in DRIVING_PROFILES]
-_PROFILE_WEIGHT_SUM = sum(_PROFILE_WEIGHTS)
+
+# ── NPC driving profiles ────────────────────────────────────────────────
+# NPCs drive NORMALLY — no ignore_vehicles, no ignore_lights.
+# They provide the cross-traffic that T-bones the ego at red lights
+# and the slower vehicles that the ego occasionally rear-ends.
+NPC_PROFILES = [
+    {'name': 'Fast NPC',       'speed_diff': -15, 'follow_dist': 2.5, 'ignore_lights': 0, 'ignore_vehicles': 0, 'weight': 25},
+    {'name': 'Normal NPC',     'speed_diff':   0, 'follow_dist': 3.5, 'ignore_lights': 0, 'ignore_vehicles': 0, 'weight': 50},
+    {'name': 'Slow NPC',       'speed_diff':  15, 'follow_dist': 5.0, 'ignore_lights': 0, 'ignore_vehicles': 0, 'weight': 25},
+]
+_NPC_PROFILE_WEIGHTS = [p['weight'] for p in NPC_PROFILES]
 
 
 # ============================================================================
@@ -205,8 +215,8 @@ class CollisionRecorder:
     Records collision events with frame indexing for retroactive labeling.
 
     Deduplication: ignores repeat collisions with the same actor within
-    a 2-second cooldown window to prevent spam (CARLA fires collision
-    events every frame while two actors remain in contact).
+    a cooldown window to prevent spam (CARLA fires collision events every
+    frame while two actors remain in contact).
     """
     COOLDOWN_SECONDS = 5.0     # Min interval between collisions with same actor
     MIN_IMPULSE = 300.0        # Minimum impulse (N·s) to count as real crash
@@ -240,7 +250,7 @@ class CollisionRecorder:
             self._skipped_low_impulse += 1
             return
 
-        # FILTER 3: Cooldown — skip if same actor within 5s
+        # FILTER 3: Cooldown — skip if same actor within cooldown period
         if actor_id in self._last_collision_time:
             elapsed = now - self._last_collision_time[actor_id]
             if elapsed < self.COOLDOWN_SECONDS:
@@ -298,18 +308,24 @@ def apply_collision_labels(scenario_data, collision_frame_indices, lookahead_fra
 
 
 # ============================================================================
-# Traffic Spawning
+# Traffic Spawning — with aggressive NPC profiles
 # ============================================================================
-def spawn_npc_vehicles(world, client, traffic_manager, count=40):
-    """Spawn NPC traffic vehicles with varied speeds."""
+def spawn_npc_vehicles(world, client, traffic_manager, count=120):
+    """
+    Spawn NPC traffic vehicles with varied but realistic driving profiles.
+    Tries ALL available spawn points to maximize vehicle count.
+    """
     bp_lib = world.get_blueprint_library()
     vehicle_bps = [bp for bp in bp_lib.filter('vehicle.*')
                    if int(bp.get_attribute('number_of_wheels')) >= 4]
     spawn_points = world.get_map().get_spawn_points()
     random.shuffle(spawn_points)
 
+    # Use ALL spawn points if count exceeds available
+    num_to_spawn = min(count, len(spawn_points))
+
     batch = []
-    for i in range(min(count, len(spawn_points))):
+    for i in range(num_to_spawn):
         bp = random.choice(vehicle_bps)
         if bp.has_attribute('color'):
             bp.set_attribute('color', random.choice(
@@ -323,18 +339,34 @@ def spawn_npc_vehicles(world, client, traffic_manager, count=40):
         if not result.error:
             vehicle_ids.append(result.actor_id)
 
-    # Set autopilot with varied speeds
+    # Assign varied driving profiles to NPCs
     tm_port = traffic_manager.get_port()
+    profile_counts = {}
     for vid in vehicle_ids:
         vehicle = world.get_actor(vid)
         if vehicle:
             vehicle.set_autopilot(True, tm_port)
-            # Mix of speeds: some slow, some fast
-            speed_diff = random.randint(-20, 50)
-            traffic_manager.vehicle_percentage_speed_difference(vehicle, speed_diff)
-            traffic_manager.distance_to_leading_vehicle(vehicle, random.uniform(3.0, 8.0))
 
-    print(f"  🚗 Spawned {len(vehicle_ids)}/{count} NPC vehicles (varied speeds)")
+            # Pick a random NPC profile (weighted)
+            profile = random.choices(NPC_PROFILES, weights=_NPC_PROFILE_WEIGHTS, k=1)[0]
+            pname = profile['name']
+            profile_counts[pname] = profile_counts.get(pname, 0) + 1
+
+            traffic_manager.vehicle_percentage_speed_difference(vehicle, profile['speed_diff'])
+            traffic_manager.distance_to_leading_vehicle(vehicle, profile['follow_dist'])
+            traffic_manager.auto_lane_change(vehicle, True)
+            try:
+                traffic_manager.ignore_lights_percentage(vehicle, profile['ignore_lights'])
+            except AttributeError:
+                pass
+            try:
+                traffic_manager.ignore_vehicles_percentage(vehicle, profile['ignore_vehicles'])
+            except AttributeError:
+                pass
+
+    print(f"  🚗 Spawned {len(vehicle_ids)}/{count} NPC vehicles")
+    for pname, cnt in sorted(profile_counts.items()):
+        print(f"     {pname}: {cnt}")
     return vehicle_ids
 
 
@@ -377,126 +409,47 @@ def spawn_pedestrians(world, client, count=30):
 
 
 # ============================================================================
-# Challenging Scenario Spawner
+# Spawn Point Selection — near intersections for more action
 # ============================================================================
-def spawn_challenging_scenario(world, ego_vehicle):
+def pick_interesting_spawn(world):
     """
-    Spawn a challenging scenario near the ego vehicle.
-
-    Types:
-      - sudden_brake: Lead vehicle ahead that will brake hard
-      - stopped_vehicle: Stationary vehicle in ego's lane
-      - jaywalker: Pedestrian crosses the road
-      - tight_traffic: Dense traffic cluster around ego
+    Pick a spawn point that is near a junction/intersection.
+    Junctions = where vehicles cross paths = more natural crashes.
+    Falls back to random if no good junction spawn found.
     """
-    scenario_type = random.choice([
-        'sudden_brake', 'jaywalker', 'tight_traffic', 'none'
-    ])
-
-    bp_lib = world.get_blueprint_library()
     carla_map = world.get_map()
-    spawned_actors = []
+    spawn_points = carla_map.get_spawn_points()
+    random.shuffle(spawn_points)
 
-    ego_loc = ego_vehicle.get_location()
-    ego_wp = carla_map.get_waypoint(ego_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+    # Prefer spawn points near junctions (50% of the time)
+    if random.random() < 0.5:
+        junction_spawns = []
+        for sp in spawn_points:
+            wp = carla_map.get_waypoint(sp.location, project_to_road=True,
+                                         lane_type=carla.LaneType.Driving)
+            if wp:
+                # Check if within ~30m of a junction
+                ahead = wp
+                for _ in range(10):
+                    nxt = ahead.next(3.0)
+                    if not nxt:
+                        break
+                    ahead = nxt[0]
+                    if ahead.is_junction:
+                        junction_spawns.append(sp)
+                        break
 
-    if ego_wp is None:
-        print(f"  ⚠️  Could not get ego waypoint for scenario")
-        return spawned_actors, scenario_type
+        if junction_spawns:
+            sp = random.choice(junction_spawns)
+            print(f"     (near junction)")
+            return sp
 
-    print(f"\n  🎬 Scenario: {scenario_type.upper()}")
-
-    if scenario_type == 'sudden_brake':
-        ahead_distance = random.uniform(15, 25)
-        wp = ego_wp
-        for _ in range(int(ahead_distance / 3)):
-            next_wps = wp.next(3.0)
-            if not next_wps:
-                break
-            wp = next_wps[0]
-
-        vehicle_bp = random.choice([bp for bp in bp_lib.filter('vehicle.*')
-                                     if int(bp.get_attribute('number_of_wheels')) >= 4])
-        spawn_tf = wp.transform
-        spawn_tf.location.z += 0.5
-
-        lead = world.try_spawn_actor(vehicle_bp, spawn_tf)
-        if lead:
-            lead.enable_constant_velocity(carla.Vector3D(5.0, 0, 0))
-            brake_time = time.time() + random.uniform(4, 7)
-            spawned_actors.append({
-                'actor': lead,
-                'type': 'sudden_braker',
-                'brake_time': brake_time,
-                'braked': False,
-            })
-            print(f"     Lead vehicle at ~{ahead_distance:.0f}m (will brake suddenly)")
-
-    elif scenario_type == 'none':
-        print(f"     Normal driving (no special scenario)")
-
-    elif scenario_type == 'jaywalker':
-        ahead_distance = random.uniform(10, 20)
-        wp = ego_wp
-        for _ in range(int(ahead_distance / 3)):
-            next_wps = wp.next(3.0)
-            if not next_wps:
-                break
-            wp = next_wps[0]
-
-        walker_bp = random.choice(bp_lib.filter('walker.pedestrian.*'))
-        spawn_tf = wp.transform
-        spawn_tf.location += carla.Location(x=0, y=-3, z=0.5)
-
-        walker = world.try_spawn_actor(walker_bp, spawn_tf)
-        if walker:
-            controller_bp = bp_lib.find('controller.ai.walker')
-            controller = world.spawn_actor(controller_bp, carla.Transform(), attach_to=walker)
-            world.tick()
-            controller.start()
-            cross_location = spawn_tf.location + carla.Location(x=0, y=8, z=0)
-            controller.go_to_location(cross_location)
-            controller.set_max_speed(random.uniform(1.5, 2.5))
-            spawned_actors.append({
-                'actor': walker, 'type': 'jaywalker', 'controller': controller
-            })
-            print(f"     Jaywalker at ~{ahead_distance:.0f}m (crossing road)")
-
-    elif scenario_type == 'tight_traffic':
-        spawn_points = carla_map.get_spawn_points()
-        random.shuffle(spawn_points)
-        count = 0
-        for sp in spawn_points[:15]:
-            if ego_loc.distance(sp.location) < 60:
-                vehicle_bp = random.choice([bp for bp in bp_lib.filter('vehicle.*')
-                                             if int(bp.get_attribute('number_of_wheels')) >= 4])
-                npc = world.try_spawn_actor(vehicle_bp, sp)
-                if npc:
-                    speed = random.uniform(2.0, 6.0)
-                    fwd = sp.get_forward_vector()
-                    npc.enable_constant_velocity(carla.Vector3D(fwd.x * speed, fwd.y * speed, 0))
-                    spawned_actors.append({'actor': npc, 'type': 'traffic'})
-                    count += 1
-        print(f"     Spawned {count} tight-traffic vehicles")
-
-    return spawned_actors, scenario_type
+    return random.choice(spawn_points)
 
 
 # ============================================================================
 # Cleanup Helpers
 # ============================================================================
-def cleanup_scenario_actors(scenario_actors):
-    """Destroy scenario-specific actors."""
-    for actor_info in scenario_actors:
-        try:
-            if 'controller' in actor_info:
-                actor_info['controller'].stop()
-                actor_info['controller'].destroy()
-            actor_info['actor'].destroy()
-        except Exception:
-            pass
-
-
 def cleanup_traffic(world, client, vehicle_ids, walker_ids, ctrl_ids):
     """Destroy all NPC traffic."""
     # Stop walker controllers first
@@ -542,10 +495,10 @@ def write_scenario_to_csv(csv_path, scenario_data, write_header=False):
 def main():
     parser = argparse.ArgumentParser(description='Crash probability data collector for CARLA 0.9.16')
     parser.add_argument('--town', default=DEFAULT_TOWN, help='CARLA town to use')
-    parser.add_argument('--scenarios', type=int, default=60, help='Number of scenarios (60 ≈ 2 hours)')
-    parser.add_argument('--duration', type=int, default=120, help='Duration per scenario in seconds')
-    parser.add_argument('--npc-vehicles', type=int, default=60, help='Number of NPC vehicles (dense)')
-    parser.add_argument('--npc-pedestrians', type=int, default=50, help='Number of pedestrians (dense)')
+    parser.add_argument('--scenarios', type=int, default=80, help='Number of scenarios')
+    parser.add_argument('--duration', type=int, default=90, help='Duration per scenario in seconds')
+    parser.add_argument('--npc-vehicles', type=int, default=120, help='Number of NPC vehicles (dense)')
+    parser.add_argument('--npc-pedestrians', type=int, default=60, help='Number of pedestrians')
     parser.add_argument('--host', default=CARLA_HOST)
     parser.add_argument('--port', type=int, default=CARLA_PORT)
     args = parser.parse_args()
@@ -553,7 +506,7 @@ def main():
     frames_per_scenario = args.duration * FPS
 
     print("=" * 70)
-    print("CRASH PROBABILITY DATA COLLECTOR")
+    print("CRASH PROBABILITY DATA COLLECTOR (Natural Crashes)")
     print("=" * 70)
     print(f"  CARLA Server:     {args.host}:{args.port}")
     print(f"  Town:             {args.town}")
@@ -564,6 +517,7 @@ def main():
     print(f"  NPC pedestrians:  {args.npc_pedestrians}")
     print(f"  Lookahead:        {LOOKAHEAD_SECONDS}s ({LOOKAHEAD_FRAMES} frames)")
     print(f"  Save directory:   {SAVE_DIR}")
+    print(f"  Strategy:         Aggressive NPCs + dense traffic + junctions")
     print("=" * 70)
 
     # Create output directory
@@ -577,7 +531,7 @@ def main():
 
     # Load initial map
     world = client.get_world()
-    current_map_name = world.get_map().name.split('/')[-1]  # e.g. 'Town01'
+    current_map_name = world.get_map().name.split('/')[-1]
     initial_town = random.choice(MAP_POOL)
     if initial_town not in current_map_name:
         print(f"  Loading {initial_town}...")
@@ -597,6 +551,9 @@ def main():
     # Traffic Manager
     traffic_manager = client.get_trafficmanager(8000)
     traffic_manager.set_synchronous_mode(True)
+    # Global TM settings — make overall traffic more chaotic
+    traffic_manager.set_global_distance_to_leading_vehicle(2.0)
+    traffic_manager.set_random_device_seed(random.randint(0, 10000))
     print(f"  ⚙️  Traffic Manager on port 8000")
 
     # Global stats
@@ -610,7 +567,7 @@ def main():
     npc_vehicle_ids = []
     walker_ids = []
     ctrl_ids = []
-    scenario_actors = []
+    scenario_idx = 0
 
     try:
         for scenario_idx in range(args.scenarios):
@@ -619,31 +576,30 @@ def main():
             print(f"{'=' * 70}")
 
             # ----------------------------------------------------------
-            # Map rotation: change map every 5 scenarios
+            # Map rotation
             # ----------------------------------------------------------
             if scenario_idx > 0 and scenario_idx % MAP_CHANGE_INTERVAL == 0:
                 new_town = random.choice(MAP_POOL)
                 if new_town not in current_map_name:
                     print(f"\n  🗺️  Switching map: {current_map_name} → {new_town}")
-                    # Restore async mode before loading
                     settings = world.get_settings()
                     settings.synchronous_mode = False
                     world.apply_settings(settings)
                     world = client.load_world(new_town)
                     current_map_name = new_town
-                    # Re-apply sync mode
                     settings = world.get_settings()
                     settings.synchronous_mode = True
                     settings.fixed_delta_seconds = 1.0 / FPS
                     world.apply_settings(settings)
                     traffic_manager = client.get_trafficmanager(8000)
                     traffic_manager.set_synchronous_mode(True)
+                    traffic_manager.set_global_distance_to_leading_vehicle(2.0)
                     print(f"  ✅ Loaded {new_town}")
 
             print(f"  🗺️  Map: {current_map_name}")
 
             # ----------------------------------------------------------
-            # Choose random weather and driving profile
+            # Weather & driving profile
             # ----------------------------------------------------------
             weather_preset = random.choice(WEATHER_PRESETS)
             driving_profile = random.choices(DRIVING_PROFILES, weights=_PROFILE_WEIGHTS, k=1)[0]
@@ -665,19 +621,18 @@ def main():
             print(f"     cloud={weather_preset['cloudiness']}  rain={weather_preset['precipitation']}  "
                   f"fog={weather_preset['fog_density']}  wet={weather_preset['wetness']}  "
                   f"sun_alt={weather_preset['sun_altitude']}")
-            print(f"  🏎️  Driving profile: {driving_profile['name']}")
+            print(f"  🏎️  Ego profile: {driving_profile['name']}")
             print(f"     speed_diff={driving_profile['speed_diff']}%  "
                   f"follow_dist={driving_profile['follow_dist']}m  "
                   f"ignore_lights={driving_profile['ignore_lights']}%  "
-                  f"lane_change={driving_profile['lane_change']}")
+                  f"ignore_vehicles={driving_profile['ignore_vehicles']}%")
 
             # ----------------------------------------------------------
-            # Spawn Ego Vehicle
+            # Spawn Ego Vehicle (near junctions when possible)
             # ----------------------------------------------------------
             bp_lib = world.get_blueprint_library()
             ego_bp = bp_lib.find('vehicle.tesla.model3')
-            spawn_points = world.get_map().get_spawn_points()
-            spawn_point = random.choice(spawn_points)
+            spawn_point = pick_interesting_spawn(world)
 
             ego_vehicle = world.spawn_actor(ego_bp, spawn_point)
             print(f"\n  🚗 Ego spawned: {ego_vehicle.type_id}")
@@ -693,26 +648,23 @@ def main():
             traffic_manager.auto_lane_change(
                 ego_vehicle, driving_profile['lane_change'])
 
-            # Try to set ignore lights/signs/vehicles (may not exist in all CARLA versions)
             try:
                 traffic_manager.ignore_lights_percentage(
                     ego_vehicle, driving_profile['ignore_lights'])
             except AttributeError:
-                print("     ⚠️  ignore_lights_percentage not available")
+                pass
             try:
                 traffic_manager.ignore_signs_percentage(
                     ego_vehicle, driving_profile.get('ignore_signs', 10))
             except AttributeError:
                 pass
-            # KEY: ignore_vehicles makes ego push through traffic → causes crashes!
             try:
                 traffic_manager.ignore_vehicles_percentage(
                     ego_vehicle, driving_profile.get('ignore_vehicles', 0))
-                print(f"     ignore_vehicles={driving_profile.get('ignore_vehicles', 0)}%")
             except AttributeError:
-                print("     ⚠️  ignore_vehicles_percentage not available")
+                pass
 
-            print(f"  ✅ TM autopilot configured with '{driving_profile['name']}' profile")
+            print(f"  ✅ TM autopilot configured")
 
             # ----------------------------------------------------------
             # Sensors: Collision + Radar
@@ -727,7 +679,7 @@ def main():
                 world.tick()
 
             # ----------------------------------------------------------
-            # Spawn Traffic
+            # Spawn Traffic (with aggressive NPC profiles)
             # ----------------------------------------------------------
             print(f"\n  Spawning traffic...")
             npc_vehicle_ids = spawn_npc_vehicles(
@@ -735,38 +687,44 @@ def main():
             walker_ids, ctrl_ids = spawn_pedestrians(
                 world, client, args.npc_pedestrians)
 
-            # Let traffic settle
-            for _ in range(10):
+            # Let traffic settle and start moving
+            for _ in range(30):
                 world.tick()
-
-            # ----------------------------------------------------------
-            # Spawn Challenging Scenario
-            # ----------------------------------------------------------
-            scenario_actors, scenario_type = spawn_challenging_scenario(
-                world, ego_vehicle)
 
             # ----------------------------------------------------------
             # Data Collection Loop
             # ----------------------------------------------------------
-            print(f"\n  🏁 Starting collection: {frames_per_scenario} frames, {args.duration}s")
+            print(f"\n  🏁 Starting collection (runs until crash)")
             print(f"  {'─' * 60}")
 
             scenario_data = []
             prev_speed = 0.0
             stuck_counter = 0
-            last_location = None
             start_time = time.time()
+            post_collision_frames = -1  # -1 = no collision yet
+            POST_COLLISION_COLLECT = FPS * 3  # collect 3s after collision then end
+            frame_idx = 0
 
-            for frame_idx in range(frames_per_scenario):
+            while True:
                 # Update collision recorder's frame counter
                 collision_recorder.frame_counter[0] = frame_idx
+
+                # If we already had a collision, count down post-crash frames
+                if post_collision_frames >= 0:
+                    post_collision_frames += 1
+                    if post_collision_frames >= POST_COLLISION_COLLECT:
+                        print(f"\n  🔄 Collision occurred — ending scenario after {POST_COLLISION_COLLECT//FPS}s post-crash data")
+                        break
+
+                # Check if a new collision just happened
+                if len(collision_recorder.collision_frame_indices) > 0 and post_collision_frames < 0:
+                    post_collision_frames = 0
 
                 # Tick the world
                 try:
                     world.tick()
                 except RuntimeError as e:
                     print(f"  ⚠️  world.tick() failed: {e}")
-                    print(f"     Collected {frame_idx} frames before crash")
                     break
 
                 # Get ego state
@@ -774,55 +732,40 @@ def main():
                     ego_velocity = ego_vehicle.get_velocity()
                     ego_speed = math.sqrt(
                         ego_velocity.x**2 + ego_velocity.y**2 + ego_velocity.z**2)
-                    ego_acceleration = (ego_speed - prev_speed) * FPS  # delta_v / delta_t
+                    ego_acceleration = (ego_speed - prev_speed) * FPS
                     prev_speed = ego_speed
 
                     ego_control = ego_vehicle.get_control()
                     ego_location = ego_vehicle.get_location()
                 except RuntimeError:
-                    print(f"  ⚠️  Ego vehicle destroyed, ending scenario")
+                    print(f"  ⚠️  Ego vehicle lost, ending scenario")
                     break
 
-                # --- Stuck recovery ---
+                # --- Stuck recovery: teleport to new location ---
                 if ego_speed < STUCK_SPEED_THRESHOLD:
                     stuck_counter += 1
 
-                    # Every 6s stuck, try forcing a lane change (alternate direction)
-                    if stuck_counter > 0 and stuck_counter % (FPS * STUCK_LANE_CHANGE_SECONDS) == 0:
-                        attempt = stuck_counter // (FPS * STUCK_LANE_CHANGE_SECONDS)
-                        direction = (attempt % 2 == 0)  # alternate left/right
-                        print(f"\n  ⚠️  Ego stuck ({stuck_counter // FPS}s) → forcing lane change ({'right' if direction else 'left'})")
-                        try:
-                            traffic_manager.force_lane_change(ego_vehicle, direction)
-                        except Exception:
-                            pass
+                    if stuck_counter >= FPS * STUCK_TELEPORT_SECONDS:
+                        print(f"\n  ⚠️  Ego stuck ({stuck_counter // FPS}s) → teleporting to new location")
+                        # Pick a new random spawn point far from current position
+                        spawn_points = world.get_map().get_spawn_points()
+                        random.shuffle(spawn_points)
+                        new_sp = None
+                        for sp in spawn_points:
+                            if ego_location.distance(sp.location) > 50:
+                                new_sp = sp
+                                break
+                        if new_sp is None:
+                            new_sp = random.choice(spawn_points)
 
-                    # After 30s stuck, destroy the nearest NPC blocking ego
-                    if stuck_counter == FPS * STUCK_DESTROY_BLOCKER_SECONDS:
-                        print(f"  ⚠️  Stuck for {STUCK_DESTROY_BLOCKER_SECONDS}s → removing blocking vehicle")
-                        # Find and destroy nearest vehicle that's blocking
-                        actors = world.get_actors().filter('vehicle.*')
-                        min_dist = 999
-                        blocker = None
-                        for a in actors:
-                            if a.id == ego_vehicle.id:
-                                continue
-                            d = ego_location.distance(a.get_location())
-                            if d < min_dist:
-                                min_dist = d
-                                blocker = a
-                        if blocker and min_dist < 10:
-                            print(f"     Destroying {blocker.type_id} at {min_dist:.1f}m")
-                            blocker.destroy()
-                            stuck_counter = 0  # Reset
-                        else:
-                            print(f"     No blocker found within 10m")
+                        ego_vehicle.set_transform(new_sp)
+                        # Brief re-settle
+                        for _ in range(5):
+                            world.tick()
+                        stuck_counter = 0
+                        print(f"     Teleported to ({new_sp.location.x:.0f}, {new_sp.location.y:.0f})")
                 else:
                     stuck_counter = 0
-
-                # Update last_location (for spectator, no teleport-break logic)
-                last_location = carla.Location(
-                    x=ego_location.x, y=ego_location.y, z=ego_location.z)
 
                 # Find nearest obstacle via RADAR sensor
                 radar_recorder.update_ego_speed(ego_speed)
@@ -849,7 +792,7 @@ def main():
                     'obstacle_type': nearest['obstacle_type'],
                     'lateral_offset': round(nearest['lateral_offset'], 3),
                     'ego_steering': round(ego_control.steer, 4),
-                    'collision_within_2s': 0,  # Set in post-processing
+                    'collision_within_2s': 0,
                 }
                 scenario_data.append(frame_data)
 
@@ -861,27 +804,13 @@ def main():
                     carla.Rotation(pitch=-20, yaw=tf.rotation.yaw)
                 ))
 
-                # Handle sudden brake scenario triggers
-                current_time = time.time()
-                for actor_info in scenario_actors:
-                    if actor_info.get('type') == 'sudden_braker' and not actor_info.get('braked', False):
-                        if current_time >= actor_info.get('brake_time', float('inf')):
-                            print(f"\n  🛑 LEAD VEHICLE BRAKING HARD! (frame {frame_idx})")
-                            try:
-                                actor_info['actor'].enable_constant_velocity(carla.Vector3D(0, 0, 0))
-                                actor_info['actor'].apply_control(
-                                    carla.VehicleControl(throttle=0.0, brake=1.0))
-                            except Exception:
-                                pass
-                            actor_info['braked'] = True
-
                 # Print status every 20 frames (1 second)
                 if frame_idx % 20 == 0 and frame_idx > 0:
                     obs_type_str = ['VEH', 'PED', '---'][nearest['obstacle_type']]
                     elapsed = time.time() - start_time
                     collisions_so_far = len(collision_recorder.collision_frame_indices)
 
-                    print(f"  [{frame_idx:5d}/{frames_per_scenario}] "
+                    print(f"  [{frame_idx:5d}] "
                           f"SPD:{ego_speed:5.1f}m/s  "
                           f"ACC:{ego_acceleration:+6.1f}m/s²  "
                           f"DIST:{nearest['distance']:5.1f}m  "
@@ -892,6 +821,7 @@ def main():
                           f"COL:{collisions_so_far}  "
                           f"[{elapsed:.0f}s]")
 
+                frame_idx += 1
             # ----------------------------------------------------------
             # Post-process: Apply Collision Labels
             # ----------------------------------------------------------
@@ -927,7 +857,7 @@ def main():
                 print(f"       rel_velocity:  {min(rels):+6.1f} - {max(rels):+6.1f} m/s  (avg: {np.mean(rels):+.1f})")
                 print(f"       ttc:           {min(ttcs):6.1f} - {max(ttcs):6.1f} s    (avg: {np.mean(ttcs):.1f})")
 
-            # Write to CSV (append if file already exists)
+            # Write to CSV
             write_header = not os.path.exists(csv_path)
             write_scenario_to_csv(csv_path, scenario_data, write_header=write_header)
 
@@ -949,12 +879,10 @@ def main():
             print(f"\n  🧹 Cleaning up scenario {scenario_idx + 1}...")
             collision_recorder.cleanup()
             radar_recorder.cleanup()
-            cleanup_scenario_actors(scenario_actors)
             cleanup_traffic(world, client, npc_vehicle_ids, walker_ids, ctrl_ids)
             npc_vehicle_ids = []
             walker_ids = []
             ctrl_ids = []
-            scenario_actors = []
 
             if ego_vehicle:
                 try:
@@ -964,7 +892,7 @@ def main():
                 ego_vehicle = None
 
             print(f"  ✅ Cleanup complete")
-            time.sleep(2)  # Let CARLA settle between scenarios
+            time.sleep(1)
 
     except KeyboardInterrupt:
         print(f"\n\n  ⚠️  Interrupted by user after scenario {scenario_idx + 1}")
@@ -991,7 +919,6 @@ def main():
             except Exception:
                 pass
 
-        cleanup_scenario_actors(scenario_actors)
         cleanup_traffic(world, client, npc_vehicle_ids, walker_ids, ctrl_ids)
 
         if ego_vehicle:
